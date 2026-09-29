@@ -310,6 +310,32 @@ def test_validate_intent_rejects_client_supplied_roll(runtime, rule, tmp_path) -
     assert "d20" in verdict["error"]
 
 
+def test_apply_event_batch_fails_closed_on_unknown_event(runtime, rule, tmp_path) -> None:
+    """不认识的事件必须让整批失败，**不能静默丢弃权威变更**。
+
+    静默跳过会让"玩家看到球火生效了，slot 没扣"这类 bug 变得极难查——
+    而且它会直接破坏“全部成功或全部不发生”。
+    """
+
+    _registry, instance = _game(tmp_path, "p5")
+    card = runtime.normalize_character_submission(
+        rule, runtime.finalize_character(rule, _draft()), "zh-CN",
+    )
+    _join(instance, card, runtime=runtime)
+
+    with pytest.raises(ValueError, match="不支持的事件类型"):
+        runtime.apply_event_batch(
+            instance, {"events": [{"type": "dnd2024.combat.started"}]},
+        )
+    with pytest.raises(ValueError, match="非对象事件"):
+        runtime.apply_event_batch(instance, {"events": ["nope"]})
+    with pytest.raises(ValueError, match="未声明的资源"):
+        runtime.apply_event_batch(instance, {"events": [{
+            "type": "custom.resource.changed", "actor_id": UID,
+            "resource_id": "mana", "delta": -1,
+        }]})
+
+
 def test_stage_b_pipeline_needs_no_manual_seed(runtime, rule, tmp_path) -> None:
     """建卡 + 加入之后，权威意图应当直接可用（不再手工 ``seed_rule_snapshot``）。"""
 
@@ -331,7 +357,16 @@ def test_stage_b_pipeline_needs_no_manual_seed(runtime, rule, tmp_path) -> None:
     assert resolved["ok"] is True
     applied = runtime.apply_event_batch(instance, resolved["event_batch"])
     assert applied.get("applied") is True
+    # 裁定记录必须被保留 —— 叙事层靠它读掷骰与成功度，不能静默丢弃。
+    assert applied["recorded_events"], "裁定记录没被 reducer 保留"
+    recorded = applied["recorded_events"][0]
+    assert recorded["type"] == "custom.check.resolved"
+    # 掷骰与成功度必须一起留下来 —— 叙事层要靠它决定"怎么讲"。
+    assert recorded["degree"]
+    assert recorded["degree_label"]
+    assert recorded["target"] is not None
     # 掷骰结果随机，只断言落在声明区间内、事件账本有记录。
     resources = instance.ruleset_state["players"][UID]["resources"]
     assert 0 <= resources["resolve"] <= 99
     assert instance.event_ledger
+    assert instance.event_ledger[-1]["recorded"][0]["type"] == "custom.check.resolved"

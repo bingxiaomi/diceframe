@@ -100,6 +100,17 @@ PROFESSIONAL_BUILDER = _env_flag("DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER")
 INTENT_CHECK = "custom.check.roll"
 INTENT_ADJUST = "custom.resource.adjust"
 
+#: **记录型事件**：进账本、进 reducer 输出供叙事与审计读取，但本身不改变状态。
+#:
+#: 它们必须在这里**显式声明**，不能靠"不认识就跳过"。区别很重要：
+#:   - 显式声明 = 契约（叙事层可以依赖它存在）；
+#:   - 静默跳过 = bug 温床（``custom.check.resolved`` 曾经就这样被丢掉，
+#:     导致掷骰与成功度根本到不了叙事层）。
+#:
+#: 对齐 D&D 2024 的 reducer：``intent.submitted`` / ``check.resolved`` 等在那里
+#: 也是列在 match 里的空操作（``dnd2024/combat/reducer.py``）。
+RECORD_ONLY_EVENTS = frozenset({"custom.check.resolved"})
+
 
 @lru_cache(maxsize=64)
 def _mechanics_from_json(raw: str) -> CustomMechanics:
@@ -846,7 +857,17 @@ class CustomDeclarativeRuntime:
     def apply_event_batch(
         self, instance: Any, batch: dict[str, Any],
     ) -> dict[str, Any]:
-        """把 EventBatch 落到 ``ruleset_state``。唯一的状态写入口。"""
+        """把 EventBatch 落到 ``ruleset_state``。**唯一的状态写入口**。
+
+        失败语义是 **fail-closed**：任何不认识 / 不完整的事件都直接抛错，
+        让整批由调用方回滚 —— **不静默跳过**。
+
+        「全部成功或全部不发生」由宿主保证：``submit_intent`` 在
+        ``instance._lock`` 内先快照 ``before``，异常时调
+        ``instance.restore_ruleset_transaction(before)``。所以这里不做半回滚，
+        否则会出现两套回滚语义。参考 D&D 2024 的 reducer：不认识的事件类型
+        抛 ``EventBatchError``。
+        """
 
         events = batch.get("events")
         if not isinstance(events, list):
@@ -854,19 +875,34 @@ class CustomDeclarativeRuntime:
         state = custom_state.read_state(instance)
         mechanics = _mechanics_for(instance)
         applied_events: list[dict[str, Any]] = []
+        recorded_events: list[dict[str, Any]] = []
         for event in events:
             if not isinstance(event, dict):
+                raise ValueError(
+                    f"event batch 里混入了非对象事件：{type(event).__name__}"
+                )
+            event_type = str(event.get("type") or "")
+            if event_type in RECORD_ONLY_EVENTS:
+                recorded_events.append(deepcopy(event))
                 continue
-            if str(event.get("type") or "") != "custom.resource.changed":
-                continue
+            if event_type != "custom.resource.changed":
+                raise ValueError(
+                    f"不支持的事件类型：{event_type!r}（fail-closed："
+                    "宁可整批回滚，也不静默丢弃权威变更）"
+                )
             uid = str(event.get("actor_id") or "")
-            spec = _find_resource(mechanics, str(event.get("resource_id") or ""))
-            if not uid or spec is None:
-                continue
+            if not uid:
+                raise ValueError("custom.resource.changed 缺少 actor_id")
+            resource_id = str(event.get("resource_id") or "")
+            spec = _find_resource(mechanics, resource_id)
+            if spec is None:
+                raise ValueError(f"未声明的资源：{resource_id!r}")
             try:
                 delta = int(event.get("delta", 0) or 0)
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"资源 {resource_id} 的 delta 不是整数：{event.get('delta')!r}"
+                ) from exc
             seat = _ensure_seat(state, instance, mechanics, uid)
             resources = seat["resources"]
             before = int(resources.get(spec.id, spec.default))
@@ -890,20 +926,32 @@ class CustomDeclarativeRuntime:
                 "reason": str(event.get("reason") or ""),
             })
 
-        if not applied_events:
-            return {"applied": False, "reason": "no-applicable-events", "state_version": int(state.get("revision", 0) or 0)}
+        if not applied_events and not recorded_events:
+            return {
+                "applied": False,
+                "reason": "no-applicable-events",
+                "state_version": int(state.get("revision", 0) or 0),
+                "events": [],
+                "recorded_events": [],
+            }
 
         written = custom_state.write_state(instance, state)
         entry = {
             "batch_id": str(batch.get("batch_id") or ""),
             "intent_type": str(batch.get("intent_type") or ""),
             "events": applied_events,
+            # 记录型事件单独一栏：叙事与记忆层靠它读掷骰与成功度。
+            "recorded": recorded_events,
         }
         custom_state.append_event(instance, entry)
         return {
-            "applied": True,
+            # ``applied`` = 这一批做了事（改了状态**或**留下了裁定记录）。
+            "applied": bool(applied_events or recorded_events),
+            # ``changed_state`` = 真的改了权威数值。
+            "changed_state": bool(applied_events),
             "state_version": int(written.get("revision", 0) or 0),
             "events": applied_events,
+            "recorded_events": recorded_events,
         }
 
     def memory_deltas_from_event_batch(
