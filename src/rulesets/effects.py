@@ -54,6 +54,9 @@ __all__ = [
 #: 时长的计时单位。``None``/缺失 = 永久（直到被显式移除）。
 DURATION_KINDS = ("round", "turn", "rest", "scene")
 
+#: 呈现层根：描述性字段。权威数值与它分开，效果写不进去。
+_PRESENTATION_ROOT = "presentation"
+
 MAX_EFFECTS_PER_ACTOR = 32
 
 
@@ -72,6 +75,12 @@ class Change:
     def validate(self) -> None:
         if not str(self.key or "").strip():
             raise EffectError("修正量缺少 key（点分路径，例如 derived.armor_class）")
+        if str(self.key).split(".")[0] == _PRESENTATION_ROOT:
+            # 在**写入时**就挡住，而不是留到读取时才炸：一条写坏的修正量
+            # 躺在账本里会让之后每一次投影都失败，等于污染了整个角色。
+            raise EffectError(
+                f"修正量 {self.key} 写的是呈现层；呈现不是权威数值，效果写不进去"
+            )
         if self.op not in EFFECT_CHANGE_OPS:
             raise EffectError(
                 f"修正量 {self.key} 的算子 {self.op!r} 未知"

@@ -46,6 +46,14 @@ from src.rulesets.attempts import record_attempt as record_attempt_entry
 from src.rulesets.attempts import retry_verdict as evaluate_retry
 from src.rulesets.attempts import world_versions as snapshot_world_versions
 from src.rulesets.contracts import RulesetCapabilities
+from src.rulesets.effects import (
+    ActiveEffect,
+    Change,
+    advance_durations,
+    effects_for,
+    project as project_effects,
+    upsert_effect,
+)
 from src.rulesets.world import apply_effects as apply_world_effects
 from src.rulesets.custom import binding as custom_binding
 from src.rulesets.custom import projection as custom_projection
@@ -120,6 +128,9 @@ RECORD_ONLY_EVENTS = frozenset({"custom.check.resolved"})
 #: 尝试记录事件。还原器会把它**推到批次末尾**才执行：记录里的世界版本必须是
 #: 本批世界变更落盘**之后**的版本，否则"失败本身改了目标"的尝试会把自己作废。
 EVENT_ATTEMPT_RECORD = "custom.attempt.record"
+
+#: 给行动者挂一个活跃效果。有效值在读取时算（base + effects），不写基础值。
+EVENT_EFFECT_APPLIED = "custom.effect.applied"
 
 
 @lru_cache(maxsize=64)
@@ -879,7 +890,9 @@ class CustomDeclarativeRuntime:
             if short is not None:
                 # 不掷骰：只把裁定本身记下来，不产效果。
                 return _short_circuit_batch(actor, intent_type, uid, check, short)
-            resources = self._seat_resources(instance, uid)
+            # 取**有效值**而不是基础值：挂着的效果必须真的影响这次检定的目标数，
+            # 否则"效果生效了"就只是个账面数字。
+            resources = self._effective_resources(instance, uid)
             target = custom_state.resolve_target(
                 mechanics, self._sheet(instance, uid), ref=check.target, resources=resources,
             )
@@ -901,6 +914,21 @@ class CustomDeclarativeRuntime:
                     "resource_id": effect.resource,
                     "delta": delta,
                     "reason": f"{check.name}:{outcome.degree_label}",
+                })
+            for spec in mechanics.character_effects:
+                if spec.check != check.id or spec.degree != outcome.degree_id:
+                    continue
+                events.append({
+                    "type": EVENT_EFFECT_APPLIED,
+                    "actor_id": uid,
+                    "effect_id": spec.id,
+                    "source": f"{check.name}:{outcome.degree_label}",
+                    "label": spec.label,
+                    "changes": [
+                        {"key": key, "op": op, "value": value}
+                        for key, op, value in spec.changes
+                    ],
+                    "duration": deepcopy(spec.duration),
                 })
             world_effects: list[dict[str, Any]] = []
             attempt_events: list[dict[str, Any]] = []
@@ -1004,6 +1032,50 @@ class CustomDeclarativeRuntime:
                 # 刻意不在循环里立即写：记录里的世界版本必须是**本批变更落盘
                 # 之后**的版本，所以推到循环外、世界变更都落完之后再处理。
                 deferred_attempts.append(dict(event))
+                continue
+            if event_type == EVENT_EFFECT_APPLIED:
+                ledger = state.setdefault("effects", {})
+                if not isinstance(ledger, dict):
+                    raise ValueError(
+                        "ruleset_state.effects 必须是 {uid: [效果]} 形式的对象"
+                    )
+                uid = str(event.get("actor_id") or "")
+                if not uid:
+                    raise ValueError("custom.effect.applied 缺少 actor_id")
+                effect_id = str(event.get("effect_id") or "")
+                raw_changes = event.get("changes")
+                if not isinstance(raw_changes, list) or not raw_changes:
+                    raise ValueError(f"效果 {effect_id!r} 缺少 changes")
+                # upsert 而非 append：同一个效果被描述两次是**续期**，不是叠层。
+                # 叠层会让"这个 +2 哪来的"无法回答。
+                written = upsert_effect(ledger, ActiveEffect(
+                    id=effect_id,
+                    target_uid=uid,
+                    changes=tuple(
+                        Change(
+                            str(change.get("key") or ""),
+                            str(change.get("op") or ""),
+                            change.get("value"),
+                        )
+                        for change in raw_changes
+                        if isinstance(change, dict)
+                    ),
+                    source=str(event.get("source") or ""),
+                    note=str(event.get("label") or ""),
+                    duration=(
+                        deepcopy(event.get("duration"))
+                        if isinstance(event.get("duration"), dict)
+                        else None
+                    ),
+                ))
+                applied_events.append({
+                    "type": EVENT_EFFECT_APPLIED,
+                    "actor_id": uid,
+                    "effect_id": written["id"],
+                    "changes": written["changes"],
+                    "source": written["source"],
+                    "duration": written.get("duration"),
+                })
                 continue
             if event_type != "custom.resource.changed" and event_type != "world.changed":
                 raise ValueError(
@@ -1226,6 +1298,44 @@ class CustomDeclarativeRuntime:
         )
 
     # ------------------------------------------------------------------
+    # 活跃效果：基础值 + 效果 = 有效值
+    # ------------------------------------------------------------------
+
+    def active_effects(self, instance: Any, uid: str) -> list[dict[str, Any]]:
+        """某个角色挂着的效果（带来源与剩余时长）。
+
+        这是"这个 +5 哪来的、什么时候到期"的答案。没有它，效果就只是
+        一个无法追溯的数字漂移。
+        """
+
+        state = custom_state.read_state(instance)
+        raw_ledger = state.get("effects")
+        return effects_for(raw_ledger if isinstance(raw_ledger, dict) else {}, uid)
+
+    def effective_resources(self, instance: Any, uid: str) -> dict[str, int]:
+        """席位资源的**有效值**（基础值 + 活跃效果）。基础值本身不变。"""
+
+        return self._effective_resources(instance, uid)
+
+    def expire_effects(self, instance: Any, kind: str) -> list[dict[str, Any]]:
+        """时间推进：把到期的效果出列，返回过期的那些。
+
+        基础值从未被修改过，所以"恢复"不需要任何回滚代码 —— 删掉效果，
+        有效值自己就回去了。
+        """
+
+        state = custom_state.read_state(instance)
+        raw_ledger = state.get("effects")
+        if not isinstance(raw_ledger, dict) or not raw_ledger:
+            return []
+        expired = advance_durations(raw_ledger, kind)
+        if not expired:
+            return []
+        state["effects"] = raw_ledger
+        custom_state.write_state(instance, state)
+        return expired
+
+    # ------------------------------------------------------------------
     # 可选叙事钩子
     # ------------------------------------------------------------------
 
@@ -1349,6 +1459,30 @@ class CustomDeclarativeRuntime:
         seat = (state.get("players") or {}).get(uid)
         resources = seat.get("resources") if isinstance(seat, dict) else None
         return resources if isinstance(resources, dict) else {}
+
+    def _effective_resources(self, instance: Any, uid: str) -> dict[str, int]:
+        """席位资源的**有效值** = 基础值 + 活跃效果。
+
+        基础值本身不动：投影出一份新的字典。所以效果过期时不需要"减回去"，
+        那个 +2 自然就没了。
+        """
+
+        base = self._seat_resources(instance, uid)
+        if not base or not uid:
+            return base
+        state = custom_state.read_state(instance)
+        raw_ledger = state.get("effects")
+        active = effects_for(
+            raw_ledger if isinstance(raw_ledger, dict) else {}, uid,
+        )
+        if not active:
+            return base
+        projected = project_effects({"resources": base}, active)
+        return {
+            key: int(value)
+            for key, value in (projected.get("resources") or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
 
 
 def _ensure_seat(

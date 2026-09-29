@@ -124,6 +124,12 @@
        "intent_family": "open", "approach_signature": "force",
        "retry_policy": "REQUIRES_CHANGED_CIRCUMSTANCE"}
     ],
+    "character_effects": [
+      {"check": "will_check", "degree": "failure", "id": "will_shaken",
+       "label": "意志动摇",
+       "changes": [{"key": "resources.resolve", "op": "subtract", "value": 5}],
+       "duration": {"type": "round", "remaining": 2}}
+    ],
     "authoritative_fields": ["resources", "attributes", "skills"]
   }
 }

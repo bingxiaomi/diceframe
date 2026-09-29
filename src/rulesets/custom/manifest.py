@@ -72,6 +72,7 @@ from typing import Any
 
 from src.rulesets.adjudication import EFFECT_CHANGE_OPS
 from src.rulesets.attempts import RetryPolicy
+from src.rulesets.effects import DURATION_KINDS
 
 MAX_RESOURCES = 24
 MAX_CHECKS = 48
@@ -82,6 +83,9 @@ MAX_WORLD_EFFECTS = 64
 
 #: 世界效果允许的字段根前缀。``presentation`` 刻意不在其中。
 _WORLD_FIELD_ROOTS = ("state.", "tags")
+
+#: 角色效果禁止写的字段根前缀。
+_EFFECT_FORBIDDEN_PREFIXES = ("presentation",)
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _COMPARISONS = frozenset({"lte", "gte"})
@@ -225,6 +229,22 @@ class WorldEffectSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class CharacterEffectSpec:
+    """检定结果 → 给行动者挂一个活跃效果（基础值 + 效果 = 有效值）。
+
+    效果**永远不直接改基础数值**：它只往 ``项目`` 里加一条带来源与时长的
+    修正量，有效值在读取时算出来。
+    """
+
+    check: str
+    degree: str
+    id: str
+    label: str
+    changes: tuple[tuple[str, str, Any], ...]
+    duration: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CustomMechanics:
     resources: tuple[ResourceSpec, ...]
     checks: tuple[CheckSpec, ...]
@@ -232,6 +252,7 @@ class CustomMechanics:
     authoritative_fields: tuple[str, ...]
     world: tuple[WorldObjectSpec, ...] = ()
     world_effects: tuple[WorldEffectSpec, ...] = ()
+    character_effects: tuple[CharacterEffectSpec, ...] = ()
 
     @property
     def is_empty(self) -> bool:
@@ -604,6 +625,77 @@ def _parse_world_effects(
     return tuple(specs)
 
 
+def _parse_character_effects(
+    raw: Any, *, checks: tuple[CheckSpec, ...],
+) -> tuple[CharacterEffectSpec, ...]:
+    """解析 ``custom_mechanics.character_effects``：检定结果 → 角色活跃效果。
+
+    只声明"挂什么效果"，不声明"挂给谁" —— 效果永远落在行动者自己身上。
+    跨角色效果需要一个选目标的交互（TODO），现在假装支持会写进规则书里再
+    发现做不到。
+    """
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("custom_mechanics.character_effects 必须是数组")
+    check_ids = {c.id for c in checks}
+    degree_ids = {d.id for c in checks for d in c.degrees}
+    specs: list[CharacterEffectSpec] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"custom_mechanics.character_effects[{index}] 必须是对象")
+        where = f"character_effects[{index}]"
+        check_id = _require_id(item.get("check"), field=f"{where}.check")
+        if check_id not in check_ids:
+            raise ValueError(f"{where}.check 引用了未声明的检定: {check_id}")
+        degree_id = _require_id(item.get("degree"), field=f"{where}.degree")
+        if degree_id not in degree_ids:
+            raise ValueError(f"{where}.degree 引用了未声明的成功度: {degree_id}")
+        effect_id = _require_id(item.get("id"), field=f"{where}.id")
+        raw_changes = item.get("changes")
+        if not isinstance(raw_changes, list) or not raw_changes:
+            raise ValueError(f"{where}.changes 必须是非空数组")
+        changes: list[tuple[str, str, Any]] = []
+        for change_index, change in enumerate(raw_changes):
+            cw = f"{where}.changes[{change_index}]"
+            if not isinstance(change, dict):
+                raise ValueError(f"{cw} 必须是对象")
+            key = str(change.get("key") or "").strip()
+            if not key:
+                raise ValueError(f"{cw}.key 不能为空")
+            if key.split(".")[0] in _EFFECT_FORBIDDEN_PREFIXES:
+                raise ValueError(f"{cw}.key 写不进 presentation：{key!r}")
+            op = str(change.get("op") or "").strip().lower()
+            if op not in EFFECT_CHANGE_OPS:
+                raise ValueError(
+                    f"{cw}.op 必须是 {sorted(EFFECT_CHANGE_OPS)} 之一: {op!r}"
+                )
+            if "value" not in change:
+                raise ValueError(f"{cw}.value 必须给出（角色效果不接受骰式 delta）")
+            changes.append((key, op, change.get("value")))
+        duration: dict[str, Any] | None = None
+        raw_duration = item.get("duration")
+        if raw_duration is not None:
+            if not isinstance(raw_duration, dict):
+                raise ValueError(f"{where}.duration 必须是对象")
+            kind = str(raw_duration.get("type") or "").strip().lower()
+            if kind not in DURATION_KINDS:
+                raise ValueError(
+                    f"{where}.duration.type 必须是 {list(DURATION_KINDS)} 之一: {kind!r}"
+                )
+            remaining = raw_duration.get("remaining", 1)
+            if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
+                raise ValueError(f"{where}.duration.remaining 必须是非负整数")
+            duration = {"type": kind, "remaining": remaining}
+        specs.append(CharacterEffectSpec(
+            check=check_id, degree=degree_id, id=effect_id,
+            label=str(item.get("label") or "")[:64],
+            changes=tuple(changes), duration=duration,
+        ))
+    return tuple(specs)
+
+
 def parse_custom_mechanics(template: Any) -> CustomMechanics:
     """从规则模板解析 ``custom_mechanics``；未声明时返回空声明。"""
 
@@ -621,6 +713,9 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
     world_effects = _parse_world_effects(
         raw.get("world_effects"), checks=checks, world=world,
     )
+    character_effects = _parse_character_effects(
+        raw.get("character_effects"), checks=checks,
+    )
     raw_fields = raw.get("authoritative_fields")
     authoritative_fields: tuple[str, ...] = ()
     if raw_fields is not None:
@@ -633,6 +728,7 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
         resources=resources, checks=checks, effects=effects,
         authoritative_fields=authoritative_fields,
         world=world, world_effects=world_effects,
+        character_effects=character_effects,
     )
 
 
