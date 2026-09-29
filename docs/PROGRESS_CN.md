@@ -34,9 +34,23 @@ git -C <发布副本> remote add mine https://github.com/bingxiaomi/diceframe.gi
 git -C <发布副本> push --force -u mine main
 ```
 
-> 如果希望仓库变成**带完整上游历史的正常 fork**（可以正常 `git pull upstream` 合并上游更新），
-> 需要在开发副本执行 `git fetch --unshallow upstream` 拿到全量历史，再向 `mine` 强制推送。
-> 尚未执行——目前单提交快照已满足“其他机器能部署”这个目标。
+> **已完成：仓库已转为带完整上游历史的正常 fork。**
+>
+> 开发副本里跑的是 `git fetch --unshallow origin`——注意 `origin` 才是上游镜像
+> （`github.laiyagushi.com/diceframe/diceframe.git`）。开发副本**没有** `upstream` 远端，
+> 写 `upstream` 会直接报 `fatal: 'upstream' does not appear to be a git repository`
+> （发布副本里那个 `upstream` 是另外加的，两边不共享）。
+>
+> 结果：提交数由 2 变成 **1227**（最早 `453de26b` Initial public release），
+> 而 `.git` 只从 91.5 MB 涨到 92.8 MB——镜像在浅克隆时其实已经把大部分历史对象发过来了，
+> `--unshallow` 只需要补上边界缺失的那部分对象。
+>
+> 随后 `git push --force -u mine main` 把全量历史推到 `mine`，远端 `main` 与本地 `HEAD` 一致
+> （写对象 16904 个 / 约 80 MiB，经代理约 5 MiB/s）。由此可正常
+> `git pull origin main` 合并上游更新，`git merge-base` 之类的历史查询也不再失效。
+>
+> 上面那条“单提交快照”路径仍然保留，用于**不需要历史**的分发场景（体积小、推得快、
+> 不依赖代理带宽）。
 
 ---
 

@@ -19,7 +19,8 @@ DiceFrame 是一个可以自己部署的 **AI 跑团引擎**，支持 **D&D / Co
 > **本 fork 说明**：这是一个自用二开版本，在官方扩展点上新增了**自定义规则运行时**
 > （`custom:declarative`，规则机制由规则 JSON 声明，不受内置判定枚举限制）。
 > 部署、联机安全与排错请看 [`docs/DEPLOY_CN.md`](docs/DEPLOY_CN.md)；
-> 改动清单与后续计划看 [`docs/PROGRESS_CN.md`](docs/PROGRESS_CN.md)。
+> 改动清单与后续计划看 [`docs/PROGRESS_CN.md`](docs/PROGRESS_CN.md)；
+> 自定义规则的权威意图路径（Stage B）怎么测看 [`docs/STAGE_B_TEST_CN.md`](docs/STAGE_B_TEST_CN.md)。
 > 上游功能（多人桌、世界书、记忆、QQ/NapCat、D&D 2024）均未改动。
 
 这个项目适合几种场景：

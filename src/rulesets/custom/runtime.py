@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from copy import deepcopy
 from functools import lru_cache
 from typing import Any
@@ -59,9 +60,26 @@ from src.rulesets.custom.manifest import (
 logger = logging.getLogger("trpg")
 
 # ---------------------------------------------------------------------------
-# 模式开关：想启用权威意图路径（Stage B）就改成 True，并补前端 host 组件。
+# 模式开关：Stage B（权威意图路径）。默认关闭 = Stage A。
+#
+# 不用改源码：设置环境变量即可，但**必须在服务启动之前**设置，
+# 因为能力位在模块导入时求值一次。
+#
+#     PowerShell:  $env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "1"
+#     bash:        export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=1
+#
+# 打开后还需要另外两个条件，否则 HTTP 接口会明确报错：
+#   - 存档必须已绑定本运行时，否则 ``RULESET_BINDING_MISMATCH``；
+#   - 前端 host 组件要能渲染自定义意图，否则点了没用。
+# 自测：``scripts/dev/test_stage_b.py``（离线，不需要服务/LLM/token）。
+# 说明：``docs/STAGE_B_TEST_CN.md``。
 # ---------------------------------------------------------------------------
-AUTHORITATIVE_INTENTS = False
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+AUTHORITATIVE_INTENTS = (
+    os.environ.get("DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS", "").strip().lower()
+    in _TRUTHY
+)
 
 INTENT_CHECK = "custom.check.roll"
 INTENT_ADJUST = "custom.resource.adjust"
@@ -89,6 +107,44 @@ def _mechanics(rule: Any) -> CustomMechanics:
         # 规则写错必须在运行时可见，而不是静默变成"不掷骰"。
         logger.error("custom_mechanics 声明非法，本局按空声明运行: %s", exc)
         return EMPTY
+
+
+def _mechanics_from_state(instance: Any) -> CustomMechanics | None:
+    """优先读存档内的规则声明快照。
+
+    ``RulesetRuntime`` 协议只在**建卡**方法（``describe_experience`` /
+    ``builder_choices`` / ``validate_character`` / ``derive_character`` /
+    ``finalize_character`` / ``normalize_character_submission``）里把 ``rule``
+    交给运行时；游戏期方法（``available_intents`` / ``resolve_intent`` /
+    ``apply_event_batch`` / ``gameplay_view`` / ``build_llm_view``）只拿得到
+    ``instance``。所以声明必须在建卡时经 ``seed_rule_snapshot`` 快照进
+    ``ruleset_state``，游戏期从存档读。
+
+    这也让存档自包含：规则文件之后被改动，不会让进行中的对局惄惄换规则
+    （要换规则就递增 ``CONTENT_VERSION`` 并走迁移）。
+    """
+
+    state = getattr(instance, "ruleset_state", None)
+    if not isinstance(state, dict):
+        return None
+    declaration = state.get("mechanics")
+    if declaration is None:
+        return None
+    try:
+        return _mechanics_from_json(
+            json.dumps(declaration, sort_keys=True, ensure_ascii=False)
+        )
+    except (TypeError, ValueError) as exc:
+        logger.error("ruleset_state.mechanics 快照非法，回退规则对象: %s", exc)
+        return None
+
+
+def _mechanics_for(instance: Any) -> CustomMechanics:
+    """游戏期取 mechanics：存档快照优先，其次宿主传入的规则对象。"""
+
+    return _mechanics_from_state(instance) or _mechanics(
+        CustomDeclarativeRuntime._rule(instance)
+    )
 
 
 class CustomDeclarativeRuntime:
@@ -173,8 +229,7 @@ class CustomDeclarativeRuntime:
 
         if not self.capabilities.authoritative_intents:
             return []
-        rule = self._rule(instance)
-        mechanics = _mechanics(rule)
+        mechanics = _mechanics_for(instance)
         if not isinstance(getattr(instance, "players", None), dict):
             return []
         if str(actor_id or "") not in instance.players:
@@ -226,7 +281,7 @@ class CustomDeclarativeRuntime:
                 return {"ok": False, "code": "ACTOR_NOT_IN_GAME", "error": "行动者不在本局中"}
         elif actor:
             return {"ok": False, "code": "INVALID_ACTOR", "error": "行动者身份不合法"}
-        mechanics = _mechanics(self._rule(instance))
+        mechanics = _mechanics_for(instance)
         if intent_type == INTENT_CHECK:
             if _find_check(mechanics, str(intent.get("check_id") or "")) is None:
                 return {"ok": False, "code": "UNKNOWN_CHECK", "error": "未声明的检定"}
@@ -243,7 +298,7 @@ class CustomDeclarativeRuntime:
         verdict = self.validate_intent(instance, intent)
         if not verdict.get("ok"):
             return verdict
-        mechanics = _mechanics(self._rule(instance))
+        mechanics = _mechanics_for(instance)
         actor = str(intent.get("actor_id") or "")
         uid = actor[len("player:"):] if actor.startswith("player:") else ""
         intent_type = str(intent.get("type") or "")
@@ -315,7 +370,7 @@ class CustomDeclarativeRuntime:
         if not isinstance(events, list):
             raise ValueError("event batch 缺少 events 数组")
         state = custom_state.read_state(instance)
-        mechanics = _mechanics(self._rule(instance))
+        mechanics = _mechanics_for(instance)
         applied_events: list[dict[str, Any]] = []
         for event in events:
             if not isinstance(event, dict):
@@ -389,7 +444,7 @@ class CustomDeclarativeRuntime:
         self, instance: Any, viewer_id: str = "", viewer_is_gm: bool = False,
     ) -> dict[str, Any]:
         return custom_projection.gameplay_view(
-            instance, _mechanics(self._rule(instance)),
+            instance, _mechanics_for(instance),
             viewer_id=viewer_id, viewer_is_gm=viewer_is_gm,
         )
 
@@ -397,7 +452,7 @@ class CustomDeclarativeRuntime:
         ledger = getattr(instance, "event_ledger", None)
         latest = ledger[-1] if isinstance(ledger, list) and ledger else None
         return custom_projection.build_llm_view(
-            instance, _mechanics(self._rule(instance)), latest_event=latest,
+            instance, _mechanics_for(instance), latest_event=latest,
         )
 
     # ------------------------------------------------------------------
@@ -414,7 +469,7 @@ class CustomDeclarativeRuntime:
         权威值只能经 ``apply_event_batch`` 变化。
         """
 
-        mechanics = _mechanics(self._rule(instance))
+        mechanics = _mechanics_for(instance)
         if not mechanics.authoritative_fields:
             return dict(update)
         filtered = deepcopy(update)
@@ -429,7 +484,7 @@ class CustomDeclarativeRuntime:
         """新席位加入时派发声明式资源。best-effort，失败不阻断加入。"""
 
         try:
-            mechanics = _mechanics(self._rule(instance))
+            mechanics = _mechanics_for(instance)
             if not mechanics.resources:
                 return
             state = custom_state.read_state(instance)
@@ -466,6 +521,26 @@ class CustomDeclarativeRuntime:
         if isinstance(template, dict):
             return type("_Rule", (), {"template": template, "rule_id": ""})()
         return None
+
+    @staticmethod
+    def seed_rule_snapshot(instance: Any, rule: Any) -> bool:
+        """把规则声明快照进 ``ruleset_state``，返回是否写入。
+
+        这是游戏期方法看到规则声明的**唯一**通道（协议不把 ``rule`` 传给
+        ``available_intents`` / ``resolve_intent`` 等）。拿到 ``rule`` 的入口
+        必须至少调用一次：建卡流程、规则切换、测试夹具。
+        """
+
+        template = getattr(rule, "template", None)
+        if not isinstance(template, dict):
+            return False
+        declaration = template.get("custom_mechanics")
+        if declaration is None:
+            return False
+        state = custom_state.read_state(instance)
+        state["mechanics"] = deepcopy(declaration)
+        custom_state.write_state(instance, state)
+        return True
 
     @staticmethod
     def _sheet(instance: Any, uid: str) -> Any:
