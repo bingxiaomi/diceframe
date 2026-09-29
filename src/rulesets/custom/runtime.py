@@ -39,7 +39,14 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from src.rulesets.adjudication import Resolution, effect_descriptors_from, intent_field_violations
+from src.rulesets.adjudication import (
+    CONSUMPTION_FAILED,
+    Resolution,
+    consumption_charges,
+    consumption_checked_before_roll,
+    effect_descriptors_from,
+    intent_field_violations,
+)
 from src.rulesets.attempts import RetryPolicy
 from src.rulesets.attempts import failure_sticks as evaluate_failure_sticks
 from src.rulesets.attempts import record_attempt as record_attempt_entry
@@ -485,12 +492,16 @@ def _world_effect_payload(spec: Any, rng: Any) -> dict[str, Any]:
 def _short_circuit_batch(
     actor: str, intent_type: str, uid: str, check: Any,
     verdict: tuple[Any, list[str]],
+    extra: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """不掷骰的裁定：只记下裁定本身。
+    """不掷骰的裁定：记下裁定本身，外加**骰前就该发生的**代价。
 
-    **刻意不产效果**：``AUTO_SUCCESS`` 该落哪个档位的效果，是规则作者该表态
-    的事（需要类似 ``auto_success_degree`` 的声明）；现在自己挑一档就是发明规则。
-    本片的目标是"不再掷骰、不再刷骰、并给出可读的理由"。
+    **刻意不产成功度效果**：``AUTO_SUCCESS`` 该落哪个档位的效果，是规则作者
+    该表态的事（需要类似 ``auto_success_degree`` 的声明）；现在自己挑一档
+    就是发明规则。
+
+    但 `ON_DECLARE` 的消耗不在此列 —— 它与成功度无关，"我试了"这件事
+    已经发生了，代价就该付。这也是三种时机里唯一在短路路径上可观测的区别。
 
     事件类型用既有的 ``custom.check.resolved``（在 reducer 里是记录型事件），
     所以不打破任何现有路径，叙事层靠 ``resolution`` 与 ``reason`` 工作。
@@ -503,13 +514,16 @@ def _short_circuit_batch(
             "batch_id": uuid4().hex,
             "intent_type": intent_type,
             "actor_id": actor,
-            "events": [{
-                "type": "custom.check.resolved",
-                "actor_id": uid,
-                "check_id": str(getattr(check, "id", "")),
-                "resolution": str(resolution),
-                "reason": list(reasons),
-            }],
+            "events": [
+                *list(extra or ()),
+                {
+                    "type": "custom.check.resolved",
+                    "actor_id": uid,
+                    "check_id": str(getattr(check, "id", "")),
+                    "resolution": str(resolution),
+                    "reason": list(reasons),
+                },
+            ],
         },
         "replayed": False,
         "pending_decision": None,
@@ -886,10 +900,28 @@ class CustomDeclarativeRuntime:
             check = _find_check(mechanics, str(intent.get("check_id") or ""))
             if check is None:  # validate_intent 已挡；保持 fail-closed。
                 return {"ok": False, "code": "UNKNOWN_CHECK", "error": "未声明的检定"}
+            consumptions = mechanics.consumptions_for(check.id)
+            # 骰前可负担性检查：不能先掷骰再发现扣不起 —— 那就等于白赚一次掷骰，
+            # 而且玩家已经看到结果了，再告诉他"其实不行"是无法接受的。
+            short_of = self._unaffordable(instance, uid, consumptions)
+            if short_of is not None:
+                resource_id, amount, have = short_of
+                return {
+                    "ok": False,
+                    "code": CONSUMPTION_FAILED,
+                    "error": (
+                        f"资源 {resource_id} 不足：需要 {amount}，只有 {have}"
+                    ),
+                }
             short = self._pre_roll_verdict(instance, mechanics, check, uid)
             if short is not None:
-                # 不掷骰：只把裁定本身记下来，不产效果。
-                return _short_circuit_batch(actor, intent_type, uid, check, short)
+                # 不掷骰。ON_DECLARE 仍要付（"我试了"已经发生），其余不付。
+                return _short_circuit_batch(
+                    actor, intent_type, uid, check, short,
+                    extra=self._consumption_events(
+                        mechanics, check, uid, rolled=False, succeeded=False,
+                    ),
+                )
             # 取**有效值**而不是基础值：挂着的效果必须真的影响这次检定的目标数，
             # 否则"效果生效了"就只是个账面数字。
             resources = self._effective_resources(instance, uid)
@@ -902,6 +934,12 @@ class CustomDeclarativeRuntime:
                 "actor_id": uid,
                 **outcome.to_dict(),
             })
+            # 消耗排在奖励前面：**先付钱再拿东西**。反过来的话，资源已满时
+            # 奖励会被上限截掉一段，紧接着再扣，就白亏了。
+            events.extend(self._consumption_events(
+                mechanics, check, uid,
+                rolled=True, succeeded=outcome.degree_id != check.failure_degree_id,
+            ))
             for effect in mechanics.effects:
                 if effect.check != check.id or effect.degree != outcome.degree_id:
                     continue
@@ -1459,6 +1497,57 @@ class CustomDeclarativeRuntime:
         seat = (state.get("players") or {}).get(uid)
         resources = seat.get("resources") if isinstance(seat, dict) else None
         return resources if isinstance(resources, dict) else {}
+
+    @staticmethod
+    def _consumption_events(
+        mechanics: CustomMechanics, check: Any, uid: str, *,
+        rolled: bool, succeeded: bool,
+    ) -> list[dict[str, Any]]:
+        """按时机产出消耗事件。
+
+        不产就不产 —— 该不该扣完全由 ``consumption_charges`` 决定，
+        这里不做任何自己的判断（否则扣费点会长出第二套时机语义）。
+        """
+
+        events: list[dict[str, Any]] = []
+        for spec in mechanics.consumptions_for(str(getattr(check, "id", ""))):
+            if not consumption_charges(
+                spec.timing, rolled=rolled, succeeded=succeeded,
+            ):
+                continue
+            events.append({
+                "type": "custom.resource.changed",
+                "actor_id": uid,
+                "resource_id": spec.resource,
+                "delta": -int(spec.amount),
+                "reason": f"消耗：{spec.label or spec.resource}",
+            })
+        return events
+
+    def _unaffordable(
+        self, instance: Any, uid: str, consumptions: tuple[Any, ...],
+    ) -> tuple[str, int, int] | None:
+        """骰前检查：**掷骰之前**就要付的代价够不够。不够则返回三者。
+
+        同一种资源的多笔消耗**先加起来再比较** —— 分开比较会放过
+        "两笔各 30、手上只有 50"这类情况。
+
+        ``ON_SUCCESS`` 刻意不在这里检查："失败不消耗"就是它的全部意义，
+        骰前拦截等于偷偷把它变成 ``ON_RESOLVE``。
+        """
+
+        needed: dict[str, int] = {}
+        for spec in consumptions:
+            if consumption_checked_before_roll(spec.timing):
+                needed[spec.resource] = needed.get(spec.resource, 0) + int(spec.amount)
+        if not needed:
+            return None
+        available = self._effective_resources(instance, uid)
+        for resource_id, amount in needed.items():
+            have = int(available.get(resource_id, 0) or 0)
+            if have < amount:
+                return (resource_id, amount, have)
+        return None
 
     def _effective_resources(self, instance: Any, uid: str) -> dict[str, int]:
         """席位资源的**有效值** = 基础值 + 活跃效果。

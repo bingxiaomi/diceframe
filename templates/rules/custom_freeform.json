@@ -97,6 +97,17 @@
           {"id": "nothing", "label": "纹丝不动", "fallback": true}
         ],
         "adjudication": {"can_succeed": false}
+      },
+      {
+        "id": "pick_lock",
+        "name": "撬锁",
+        "dice": "1d100",
+        "comparison": "lte",
+        "target": {"constant": 40},
+        "degrees": [
+          {"id": "opened", "label": "打开", "max_ratio": 1.0},
+          {"id": "jammed", "label": "卡住", "fallback": true}
+        ]
       }
     ],
     "effects": [
@@ -129,6 +140,12 @@
        "label": "意志动摇",
        "changes": [{"key": "resources.resolve", "op": "subtract", "value": 5}],
        "duration": {"type": "round", "remaining": 2}}
+    ],
+    "consumptions": [
+      {"check": "break_wall", "resource": "resolve", "amount": 5,
+       "timing": "ON_DECLARE", "label": "硬撼"},
+      {"check": "pick_lock", "resource": "resolve", "amount": 3,
+       "timing": "ON_SUCCESS", "label": "撬锁"}
     ],
     "authoritative_fields": ["resources", "attributes", "skills"]
   }

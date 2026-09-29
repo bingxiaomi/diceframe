@@ -41,6 +41,7 @@ from typing import Any, Mapping
 __all__ = [
     "ACTIVITY_TYPES",
     "CONSUMPTION_FAILED",
+    "ConsumptionTiming",
     "EFFECT_CHANGE_OPS",
     "EFFECT_KINDS",
     "Adjudication",
@@ -422,6 +423,46 @@ ACTIVITY_TYPES = (
 #: 消费失败时的错误码（对应 Foundry 的 ``ConsumptionError``）：
 #: 资源不够 **不是静默跳过，而是让整次裁定失败**。
 CONSUMPTION_FAILED = "CONSUMPTION_FAILED"
+
+
+class ConsumptionTiming(StrEnum):
+    """代价在哪个点上被扣。三者的差别玩家能直接感知到。
+
+    - ``ON_DECLARE``：**说了就算**。打断、放弃、甚至规则判定"这不可能成"，
+      代价都已经付了。典型是法术位 —— 手势起手就烧掉了。
+    - ``ON_RESOLVE``：**掷了就付**。成或败都付，但没掷就不付。
+    - ``ON_SUCCESS``：**成了才付**。失败时资源留着 —— "失败不消耗"本身就是
+      规则表述的一部分（例如只在搜到东西时才计入体力消耗）。
+    """
+
+    ON_DECLARE = "ON_DECLARE"
+    ON_RESOLVE = "ON_RESOLVE"
+    ON_SUCCESS = "ON_SUCCESS"
+
+
+def consumption_charges(timing: Any, *, rolled: bool, succeeded: bool) -> bool:
+    """这次裁定里，某个时机该不该扣。
+
+    ``rolled=False`` 表示检定没掷骰（被骰前裁定短路了）。于是三种时机
+    自然分成三行：ON_DECLARE 不看结果，ON_RESOLVE 看有没有掷，ON_SUCCESS
+    两个都要。
+    """
+
+    if timing == ConsumptionTiming.ON_DECLARE:
+        return True
+    if timing == ConsumptionTiming.ON_RESOLVE:
+        return rolled
+    return rolled and succeeded
+
+
+def consumption_checked_before_roll(timing: Any) -> bool:
+    """这个时机是否需要在**掷骰前**就检查付得起。
+
+    ``ON_SUCCESS`` 返回 False —— "失败不消耗"就是它的全部意义，
+    骰前拦截等于偷偷把它变成 ``ON_RESOLVE``。
+    """
+
+    return timing in (ConsumptionTiming.ON_DECLARE, ConsumptionTiming.ON_RESOLVE)
 
 
 @dataclass(frozen=True, slots=True)

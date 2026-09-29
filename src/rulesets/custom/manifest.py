@@ -70,7 +70,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from src.rulesets.adjudication import EFFECT_CHANGE_OPS
+from src.rulesets.adjudication import EFFECT_CHANGE_OPS, ConsumptionTiming
 from src.rulesets.attempts import RetryPolicy
 from src.rulesets.effects import DURATION_KINDS
 
@@ -186,6 +186,41 @@ class CheckSpec:
     #: 否则会给已有规则静默加上行为变化。
     consult_attempts: bool = False
 
+    @property
+    def failure_degree_id(self) -> str:
+        """失败档的 id。
+
+        解析阶段已经保证 ``fallback`` 档位存在、唯一、且在最后，所以那个档
+        就是失败档 —— 不需要另立一处声明，也就不会与实际分级漂移。
+        """
+
+        return self.degrees[-1].id
+
+    @property
+    def can_ever_roll(self) -> bool:
+        """这个检定是否**有可能**真的掷骰。
+
+        三个骰前问题里任一为否，就会无条件短路（不掷骰），成功度也就不存在。
+        ``consult_attempts`` 不在其中：它是**有条件**短路（看账本），仍会掷骰。
+        """
+
+        return self.can_succeed and self.can_fail and self.failure_matters
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumptionSpec:
+    """一次检定的代价：扣哪种资源、扣多少、什么时候扣。
+
+    ``amount`` 必须是**正数**。负数的"消耗"其实是奖励，那是 ``effects``
+    该干的事；混在一起会让"资源不足"这个判断失去意义。
+    """
+
+    check: str
+    resource: str
+    amount: int
+    timing: str
+    label: str = ""
+
 
 @dataclass(frozen=True, slots=True)
 class EffectSpec:
@@ -253,10 +288,14 @@ class CustomMechanics:
     world: tuple[WorldObjectSpec, ...] = ()
     world_effects: tuple[WorldEffectSpec, ...] = ()
     character_effects: tuple[CharacterEffectSpec, ...] = ()
+    consumptions: tuple[ConsumptionSpec, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         return not (self.resources or self.checks or self.effects)
+
+    def consumptions_for(self, check_id: str) -> tuple[ConsumptionSpec, ...]:
+        return tuple(spec for spec in self.consumptions if spec.check == check_id)
 
     def action_keys(self, check_id: str) -> tuple[tuple[str, str, str], ...]:
         """某个检定关联的 ``(intent_family, approach_signature, target)`` 组合。
@@ -696,6 +735,57 @@ def _parse_character_effects(
     return tuple(specs)
 
 
+def _parse_consumptions(
+    raw: Any, *, checks: tuple[CheckSpec, ...], resources: tuple[ResourceSpec, ...],
+) -> tuple[ConsumptionSpec, ...]:
+    """解析 ``custom_mechanics.consumptions``：检定 → 代价。"""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("custom_mechanics.consumptions 必须是数组")
+    check_ids = {c.id for c in checks}
+    checks_by_id = {c.id: c for c in checks}
+    resource_ids = {r.id for r in resources}
+    specs: list[ConsumptionSpec] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"custom_mechanics.consumptions[{index}] 必须是对象")
+        where = f"consumptions[{index}]"
+        check_id = _require_id(item.get("check"), field=f"{where}.check")
+        if check_id not in check_ids:
+            raise ValueError(f"{where}.check 引用了未声明的检定: {check_id}")
+        resource_id = _require_id(item.get("resource"), field=f"{where}.resource")
+        if resource_id not in resource_ids:
+            raise ValueError(f"{where}.resource 引用了未声明的资源: {resource_id}")
+        amount = item.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            # 负数消耗其实是奖励 —— 那是 effects 的活。混在一起会让
+            # "资源不足" 这个判断失去意义。
+            raise ValueError(f"{where}.amount 必须是正整数（奖励请用 effects）: {amount!r}")
+        timing = str(item.get("timing") or "").strip().upper()
+        try:
+            timing = str(ConsumptionTiming(timing))
+        except ValueError as exc:
+            raise ValueError(
+                f"{where}.timing 必须是 {[str(t) for t in ConsumptionTiming]} 之一: {timing!r}"
+            ) from exc
+        specs.append(ConsumptionSpec(
+            check=check_id, resource=resource_id, amount=amount,
+            timing=timing, label=str(item.get("label") or "")[:32],
+        ))
+        if timing != str(ConsumptionTiming.ON_DECLARE) and not checks_by_id[check_id].can_ever_roll:
+            # 死声明：这个检定骰前就会无条件短路，成功度永远不会存在，
+            # 所以 ON_RESOLVE / ON_SUCCESS 永远不会触发。与其让规则作者在
+            # 跑团时发现"我写的消耗从来没扣过"，不如加载时就拒。
+            raise ValueError(
+                f"{where}：检定 {check_id} 声明了 can_succeed/can_fail/failure_matters "
+                f"之一为 false，会无条件短路、永远不掷骰，所以 {timing} 永远不会触发"
+                f"（要先付再说，请用 ON_DECLARE）"
+            )
+    return tuple(specs)
+
+
 def parse_custom_mechanics(template: Any) -> CustomMechanics:
     """从规则模板解析 ``custom_mechanics``；未声明时返回空声明。"""
 
@@ -716,6 +806,9 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
     character_effects = _parse_character_effects(
         raw.get("character_effects"), checks=checks,
     )
+    consumptions = _parse_consumptions(
+        raw.get("consumptions"), checks=checks, resources=resources,
+    )
     raw_fields = raw.get("authoritative_fields")
     authoritative_fields: tuple[str, ...] = ()
     if raw_fields is not None:
@@ -729,6 +822,7 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
         authoritative_fields=authoritative_fields,
         world=world, world_effects=world_effects,
         character_effects=character_effects,
+        consumptions=consumptions,
     )
 
 
