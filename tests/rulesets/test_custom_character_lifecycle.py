@@ -286,6 +286,30 @@ def test_gameplay_reads_declaration_from_seat_sheet(runtime, rule, tmp_path) -> 
     assert "mechanics" not in instance.ruleset_state
 
 
+def test_validate_intent_rejects_client_supplied_roll(runtime, rule, tmp_path) -> None:
+    """客户端只能声明"想做什么"，不能声明"掷出了什么"。
+
+    ``Natural 20 不能改写现实`` 从实现纪律变成协议强制的地方。
+    """
+
+    _registry, instance = _game(tmp_path, "p4")
+    card = runtime.normalize_character_submission(
+        rule, runtime.finalize_character(rule, _draft()), "zh-CN",
+    )
+    _join(instance, card, runtime=runtime)
+
+    clean = runtime.prepare_intent_submission(
+        {"type": "custom.check.roll", "check_id": "will_check"}, UID, False,
+    )
+    assert runtime.validate_intent(instance, clean)["ok"] is True
+
+    forged = dict(clean, d20=20, total=25)
+    verdict = runtime.validate_intent(instance, forged)
+    assert verdict["ok"] is False
+    assert verdict["code"] == "CLIENT_ROLL_FORBIDDEN"
+    assert "d20" in verdict["error"]
+
+
 def test_stage_b_pipeline_needs_no_manual_seed(runtime, rule, tmp_path) -> None:
     """建卡 + 加入之后，权威意图应当直接可用（不再手工 ``seed_rule_snapshot``）。"""
 

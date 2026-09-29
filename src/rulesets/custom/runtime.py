@@ -39,6 +39,7 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
+from src.rulesets.adjudication import intent_field_violations
 from src.rulesets.contracts import RulesetCapabilities
 from src.rulesets.custom import binding as custom_binding
 from src.rulesets.custom import projection as custom_projection
@@ -744,6 +745,15 @@ class CustomDeclarativeRuntime:
             return {
                 "ok": False, "code": "UNKNOWN_INTENT",
                 "error": f"未声明的意图类型: {intent_type!r}",
+            }
+        # 硬约束：客户端只能声明"想做什么"，不能声明"掷出了什么"。
+        # 骰子由注入的服务端 RNG 产生，见 ``src/rulesets/adjudication.py``。
+        violations = intent_field_violations(intent)
+        if violations:
+            return {
+                "ok": False,
+                "code": "CLIENT_ROLL_FORBIDDEN",
+                "error": "意图不得包含掷骰结果字段：" + "、".join(violations),
             }
         actor = str(intent.get("actor_id") or "")
         if actor.startswith("player:"):
