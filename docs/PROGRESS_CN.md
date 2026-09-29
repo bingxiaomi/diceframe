@@ -6,6 +6,40 @@
 
 ---
 
+## 0. 代码仓库与发布方式
+
+| 项 | 值 |
+|---|---|
+| 你的仓库 | `https://github.com/bingxiaomi/diceframe` |
+| `mine` 远端 | 上面这个，推送目标 |
+| `upstream` 远端 | `https://github.laiyagushi.com/diceframe/diceframe.git`（国内可直连的上游镜像，供参考） |
+| 当前内容 | **单提交快照**（2094 文件 / 2360 对象 / 约 10 MB，提交号见 `git log`），不含上游 435 个 PR 的历史 |
+| 为什么用快照 | 原始工作副本是 `--depth 1` 浅克隆，直接从它推送会报 `remote unpack failed: index-pack failed` / `did not receive expected object`（差量基准缺失），而且要推 15682 个对象。快照只推 2360 个对象，最稳、其他机器 clone 也最快 |
+| 国内网络 | 直连 github.com 会超时/被重置；已配置 `http.https://github.com.proxy = http://127.0.0.1:7897`（仅对 github.com 生效） |
+
+**后续改完代码怎么发布**（当前是手动流程，尚未脚本化）：
+
+```bash
+# 1) 在开发副本里提交（如 c:\Users\user\trpg\diceframe）
+git -C <开发副本> add -A && git -C <开发副本> commit -m "feat: ..."
+
+# 2) 导出已跟踪文件的快照（git archive 天然排除 data/、构建产物、node_modules）
+git -C <开发副本> archive HEAD -o snapshot.tar
+mkdir -p <发布副本> && tar -xf snapshot.tar -C <发布副本>
+
+# 3) 在发布副本里重建单提交并推送到 mine
+git -C <发布副本> init -b main
+git -C <发布副本> add -A && git -C <发布副本> commit -m "chore: snapshot"
+git -C <发布副本> remote add mine https://github.com/bingxiaomi/diceframe.git
+git -C <发布副本> push --force -u mine main
+```
+
+> 如果希望仓库变成**带完整上游历史的正常 fork**（可以正常 `git pull upstream` 合并上游更新），
+> 需要在开发副本执行 `git fetch --unshallow upstream` 拿到全量历史，再向 `mine` 强制推送。
+> 尚未执行——目前单提交快照已满足“其他机器能部署”这个目标。
+
+---
+
 ## 1. 目标与路线（已确定）
 
 | 项 | 决定 |

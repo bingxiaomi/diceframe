@@ -33,6 +33,28 @@
 
 ## 2. 部署方式
 
+### 0）获取代码
+
+```bash
+git clone https://github.com/bingxiaomi/diceframe.git
+cd diceframe
+```
+
+> ⚠️ **国内网络注意**：直连 `github.com:443` 会超时或被重置（实测报
+> `Failed to connect to github.com port 443 after 21027 ms`，以及大流量上传时
+> `Recv failure: Connection was reset`）。如果本机有代理（例如 Clash 的 `127.0.0.1:7897`），
+> 给 git 配上即可（**只对 github.com 生效，不影响国内镜像源**）：
+>
+> ```bash
+> git config --global http.https://github.com.proxy http://127.0.0.1:7897
+> ```
+>
+> 实测走代理后推送速度从 296 KiB/s（且失败）提升到 **5.24 MiB/s**。
+> 若不想用代理，也可以把仓库镜像到 Gitee（`gitee.com` 可直连）再从那里 clone。
+
+> 💡 仓库已配置 `upstream` 远端指向国内可直连的上游镜像
+> `https://github.laiyagushi.com/diceframe/diceframe.git`，需要参考上游代码时可直接 `git fetch upstream`。
+
 ### 方式 A：源码部署（推荐，能改代码）
 
 ```bash
