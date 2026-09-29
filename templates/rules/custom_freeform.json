@@ -79,6 +79,23 @@
       {"check": "will_check", "degree": "failure", "resource": "resolve", "delta": "-1d6"},
       {"check": "will_check", "degree": "extreme", "resource": "resolve", "delta": "1"}
     ],
+    "world": [
+      {
+        "id": "sealed_door",
+        "kind": "door",
+        "state": {"locked": true, "open": false, "hp": 20},
+        "tags": ["wooden", "interactable"],
+        "presentation": {
+          "description": "一扇被某种力量封住的门，锁得死死的。"
+        }
+      }
+    ],
+    "world_effects": [
+      {"check": "will_check", "degree": "extreme", "target": "sealed_door",
+       "field": "state.locked", "op": "override", "value": false},
+      {"check": "will_check", "degree": "failure", "target": "sealed_door",
+       "field": "state.hp", "op": "subtract", "delta": "1d6"}
+    ],
     "authoritative_fields": ["resources", "attributes", "skills"]
   }
 }

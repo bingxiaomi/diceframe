@@ -54,6 +54,7 @@ __all__ = [
     "Risk",
     "Stakes",
     "check_resolved_event",
+    "effect_descriptors_from",
     "intent_field_violations",
     "normalize_degree",
     "three_question_resolution",
@@ -729,6 +730,16 @@ def check_resolved_event(adjudication: Adjudication, *, source: str = "") -> dic
     """便捷入口：裁定 → EventBatch 里的事件。"""
 
     return adjudication.to_event(source=source)
+
+
+def effect_descriptors_from(value: Any) -> tuple[EffectDescriptor, ...]:
+    """把事件 payload 里的效果数组还原成描述符。
+
+    ``world.changed`` 这类事件携带的是 JSON，落到状态前要过一遍校验。
+    不合法就抛 :class:`AdjudicationError` —— 不猜、也不静默丢弃。
+    """
+
+    return _descriptors_from(value)
 
 
 def _descriptors_from(value: Any) -> tuple[EffectDescriptor, ...]:

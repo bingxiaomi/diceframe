@@ -39,8 +39,9 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from src.rulesets.adjudication import intent_field_violations
+from src.rulesets.adjudication import effect_descriptors_from, intent_field_violations
 from src.rulesets.contracts import RulesetCapabilities
+from src.rulesets.world import apply_effects as apply_world_effects
 from src.rulesets.custom import binding as custom_binding
 from src.rulesets.custom import projection as custom_projection
 from src.rulesets.custom import state as custom_state
@@ -442,6 +443,36 @@ def _draft_from_canonical(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _world_effect_payload(spec: Any, rng: Any) -> dict[str, Any]:
+    """把一条世界效果声明变成事件 payload。
+
+    ``delta``（骰式）在这里用**注入的服务端 RNG** 解析成具体数值 ——
+    世界状态层拒绝公式，因为它拿不到 RNG。
+    """
+
+    return {
+        "kind": "world",
+        "target": spec.target,
+        "field": spec.field,
+        "op": spec.op,
+        "value": (
+            spec.value if spec.op == "override" or not spec.delta
+            else parse_delta(rng, spec.delta)
+        ),
+    }
+
+
+def _seed_world(raw_world: dict[str, Any], seed: dict[str, dict[str, Any]]) -> None:
+    """首次用到世界状态时插入初始对象；已存在的**不覆盖**。
+
+    不覆盖是必须的：否则已经解锁的门会在下一批又被规则声明重新锁上。
+    """
+
+    for object_id, payload in seed.items():
+        if object_id not in raw_world:
+            raw_world[object_id] = deepcopy(payload)
+
+
 class CustomDeclarativeRuntime:
     """自定义声明式规则的运行时实现。"""
 
@@ -824,6 +855,20 @@ class CustomDeclarativeRuntime:
                     "delta": delta,
                     "reason": f"{check.name}:{outcome.degree_label}",
                 })
+            world_effects = [
+                _world_effect_payload(spec, rng)
+                for spec in mechanics.world_effects
+                if spec.check == check.id and spec.degree == outcome.degree_id
+            ]
+            if world_effects:
+                # 一次检定只产一条 world.changed，里面包住所有世界变更 ——
+                # 叙事层与审计看到的是"这次裁定改了什么"，不是一堆碎片。
+                events.append({
+                    "type": "world.changed",
+                    "actor_id": uid,
+                    "reason": f"{check.name}:{outcome.degree_label}",
+                    "effects": world_effects,
+                })
         else:
             resource = _find_resource(mechanics, str(intent.get("resource_id") or ""))
             if resource is None:
@@ -885,11 +930,31 @@ class CustomDeclarativeRuntime:
             if event_type in RECORD_ONLY_EVENTS:
                 recorded_events.append(deepcopy(event))
                 continue
-            if event_type != "custom.resource.changed":
+            if event_type != "custom.resource.changed" and event_type != "world.changed":
                 raise ValueError(
                     f"不支持的事件类型：{event_type!r}（fail-closed："
                     "宁可整批回滚，也不静默丢弃权威变更）"
                 )
+            if event_type == "world.changed":
+                raw_world = state.setdefault("world", {})
+                if not isinstance(raw_world, dict):
+                    raise ValueError("ruleset_state.world 必须是 {id: 对象} 形式的对象")
+                # 首次用到世界状态时用规则声明播种；已存在的对象**不覆盖**，
+                # 否则已经解锁的门会在下一批又被声明重新锁上。
+                _seed_world(raw_world, mechanics.world_seed())
+                descriptors = effect_descriptors_from(event.get("effects"))
+                if not descriptors:
+                    raise ValueError("world.changed 缺少 effects")
+                touched = apply_world_effects(raw_world, descriptors)
+                if not touched:
+                    continue
+                applied_events.append({
+                    "type": "world.changed",
+                    "actor_id": str(event.get("actor_id") or ""),
+                    "objects": touched,
+                    "reason": str(event.get("reason") or ""),
+                })
+                continue
             uid = str(event.get("actor_id") or "")
             if not uid:
                 raise ValueError("custom.resource.changed 缺少 actor_id")

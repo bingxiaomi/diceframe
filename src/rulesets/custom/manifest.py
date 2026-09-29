@@ -26,8 +26,32 @@
         {"check": "sanity_check", "degree": "failure",
          "resource": "sanity", "delta": "-1d6"}
       ],
+      "world": [
+        {"id": "sealed_door", "kind": "door",
+         "state": {"locked": true, "open": false, "hp": 20},
+         "tags": ["wooden", "interactable"],
+         "presentation": {"description": "一扇被某种力量封住的门。"}}
+      ],
+      "world_effects": [
+        {"check": "sanity_check", "degree": "extreme",
+         "target": "sealed_door", "field": "state.locked",
+         "op": "override", "value": false},
+        {"check": "sanity_check", "degree": "failure",
+         "target": "sealed_door", "field": "state.hp",
+         "op": "subtract", "delta": "1d6"}
+      ],
       "authoritative_fields": ["resources", "attributes", "skills"]
     }
+
+``world`` 与 ``world_effects`` 的约定：
+
+- ``world`` 只是**初始**对象表。首次用到世界状态时插入，之后它就是权威状态，
+  **不会重播声明** —— 否则已经解锁的门会在下一局又被声明锁上。
+- ``world_effects[*].target`` 必须在 ``world`` 里声明过（fail-fast 抓拼写错误）。
+- ``field`` 只能写 ``state.*`` 与 ``tags``。``presentation.*`` **写不进去**：
+  呈现只能由权威状态派生，反向推导会让叙事污染事实。
+- ``op`` 取 Foundry 的 change 词汇；``override`` 直接取 ``value``，
+  其余数值算子取 ``value``（字面值）或 ``delta``（骰式，用服务端 RNG 解析）。
 
 ``target`` / ``initial`` / ``max`` 的取值引用语法：
 
@@ -46,10 +70,17 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from src.rulesets.adjudication import EFFECT_CHANGE_OPS
+
 MAX_RESOURCES = 24
 MAX_CHECKS = 48
 MAX_DEGREES = 8
 MAX_EFFECTS = 64
+MAX_WORLD_OBJECTS = 32
+MAX_WORLD_EFFECTS = 64
+
+#: 世界效果允许的字段根前缀。``presentation`` 刻意不在其中。
+_WORLD_FIELD_ROOTS = ("state.", "tags")
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _COMPARISONS = frozenset({"lte", "gte"})
@@ -151,15 +182,63 @@ class EffectSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class WorldObjectSpec:
+    """初始世界对象。**只用于首次播种**，之后权威状态在存档里。"""
+
+    id: str
+    kind: str
+    state: dict[str, Any]
+    tags: tuple[str, ...]
+    presentation: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class WorldEffectSpec:
+    """检定结果 → 世界状态变更。
+
+    ``value`` 与 ``delta`` 二选一：``override`` 用 ``value``（字面值，
+    非 null）；其余数值算子用 ``value`` 或 ``delta``（骰式，用服务端 RNG 解析）。
+    """
+
+    check: str
+    degree: str
+    target: str
+    field: str
+    op: str
+    value: Any = None
+    delta: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class CustomMechanics:
     resources: tuple[ResourceSpec, ...]
     checks: tuple[CheckSpec, ...]
     effects: tuple[EffectSpec, ...]
     authoritative_fields: tuple[str, ...]
+    world: tuple[WorldObjectSpec, ...] = ()
+    world_effects: tuple[WorldEffectSpec, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         return not (self.resources or self.checks or self.effects)
+
+    def world_seed(self) -> dict[str, dict[str, Any]]:
+        """初始对象表（JSON 安全），供首次播种使用。
+
+        ``tags`` 排序：保证刚播种的世界与经过一次读写的世界表示一致，
+        否则落盘结果会依赖声明顺序，diff 与测试都不稳定。
+        """
+
+        return {
+            spec.id: {
+                "kind": spec.kind,
+                "state": dict(spec.state),
+                "tags": sorted(spec.tags),
+                "presentation": dict(spec.presentation),
+                "version": 0,
+            }
+            for spec in self.world
+        }
 
 
 EMPTY = CustomMechanics(resources=(), checks=(), effects=(), authoritative_fields=())
@@ -315,6 +394,129 @@ def _parse_effects(raw: Any, *, checks: tuple[CheckSpec, ...],
     return tuple(specs)
 
 
+def _parse_world(raw: Any) -> tuple[WorldObjectSpec, ...]:
+    """解析 ``custom_mechanics.world``：**初始**对象表。"""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("custom_mechanics.world 必须是数组")
+    if len(raw) > MAX_WORLD_OBJECTS:
+        raise ValueError(f"custom_mechanics.world 最多 {MAX_WORLD_OBJECTS} 项")
+    specs: list[WorldObjectSpec] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"custom_mechanics.world[{index}] 必须是对象")
+        object_id = _require_id(item.get("id"), field=f"world[{index}].id")
+        if object_id in seen:
+            raise ValueError(f"世界对象 id 重复: {object_id}")
+        seen.add(object_id)
+        kind = str(item.get("kind") or "").strip()
+        if not kind:
+            raise ValueError(f"world[{index}].kind 不能为空")
+        state_raw = item.get("state")
+        if state_raw is not None and not isinstance(state_raw, dict):
+            raise ValueError(f"world[{index}].state 必须是对象")
+        presentation_raw = item.get("presentation")
+        if presentation_raw is not None and not isinstance(presentation_raw, dict):
+            raise ValueError(f"world[{index}].presentation 必须是对象")
+        state = dict(state_raw or {})
+        presentation = dict(presentation_raw or {})
+        overlap = sorted(set(state) & set(presentation))
+        if overlap:
+            raise ValueError(
+                f"world[{index}] 的 presentation 与 state 出现同名键 {overlap} —— "
+                "权威值与呈现必须分开，否则叙事会污染事实"
+            )
+        tags_raw = item.get("tags")
+        if tags_raw is not None and not isinstance(tags_raw, list):
+            raise ValueError(f"world[{index}].tags 必须是数组")
+        specs.append(WorldObjectSpec(
+            id=object_id,
+            kind=kind[:32],
+            state=state,
+            tags=tuple(
+                str(tag).strip()[:32] for tag in (tags_raw or ()) if str(tag).strip()
+            ),
+            presentation=presentation,
+        ))
+    return tuple(specs)
+
+
+def _parse_world_effects(
+    raw: Any, *, checks: tuple[CheckSpec, ...], world: tuple[WorldObjectSpec, ...],
+) -> tuple[WorldEffectSpec, ...]:
+    """解析 ``custom_mechanics.world_effects``：检定结果 → 世界变更。"""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("custom_mechanics.world_effects 必须是数组")
+    if len(raw) > MAX_WORLD_EFFECTS:
+        raise ValueError(f"custom_mechanics.world_effects 最多 {MAX_WORLD_EFFECTS} 项")
+    check_ids = {c.id for c in checks}
+    degree_ids = {d.id for c in checks for d in c.degrees}
+    object_ids = {o.id for o in world}
+    specs: list[WorldEffectSpec] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"custom_mechanics.world_effects[{index}] 必须是对象")
+        where = f"world_effects[{index}]"
+        check_id = _require_id(item.get("check"), field=f"{where}.check")
+        if check_id not in check_ids:
+            raise ValueError(f"{where}.check 引用了未声明的检定: {check_id}")
+        degree_id = _require_id(item.get("degree"), field=f"{where}.degree")
+        if degree_id not in degree_ids:
+            raise ValueError(f"{where}.degree 引用了未声明的成功度: {degree_id}")
+        target = _require_id(item.get("target"), field=f"{where}.target")
+        if target not in object_ids:
+            raise ValueError(f"{where}.target 引用了未声明的世界对象: {target}")
+        path = str(item.get("field") or "").strip()
+        if path == "tags" or (path.startswith("state.") and len(path) > len("state.")):
+            field_path = path
+        else:
+            raise ValueError(
+                f"{where}.field 只能是 tags 或 state.<路径>"
+                f"（presentation 写不进去）: {path!r}"
+            )
+        op = str(item.get("op") or "").strip().lower()
+        if op not in EFFECT_CHANGE_OPS:
+            raise ValueError(
+                f"{where}.op 必须是 {sorted(EFFECT_CHANGE_OPS)} 之一: {op!r}"
+            )
+        has_value = "value" in item
+        delta = str(item.get("delta") or "").strip().lower()
+        if path == "tags":
+            if op not in ("add", "subtract"):
+                raise ValueError(
+                    f"{where}：集合字段 tags 只支持 add（授予）/ subtract（剥夺），收到 {op!r}"
+                )
+            if delta:
+                raise ValueError(f"{where}：tags 不接受 delta（集合不能配骰式）")
+        if op == "override":
+            if not has_value or item.get("value") is None:
+                raise ValueError(f"{where}.op=override 必须给出非 null 的 value")
+            if delta:
+                raise ValueError(f"{where}：override 不能同时给 delta")
+        else:
+            if has_value == bool(delta):
+                raise ValueError(
+                    f"{where}：op={op} 必须且只能给出 value 或 delta 之一"
+                )
+            if has_value and item.get("value") is None:
+                raise ValueError(f"{where}：value 不能是 null")
+            if delta and not re.fullmatch(r"[+-]?\d+(d\d+)?", delta):
+                raise ValueError(
+                    f"{where}.delta 必须是整数或骰式（可带符号）: {delta!r}"
+                )
+        specs.append(WorldEffectSpec(
+            check=check_id, degree=degree_id, target=target, field=field_path,
+            op=op, value=item.get("value") if has_value else None, delta=delta,
+        ))
+    return tuple(specs)
+
+
 def parse_custom_mechanics(template: Any) -> CustomMechanics:
     """从规则模板解析 ``custom_mechanics``；未声明时返回空声明。"""
 
@@ -328,6 +530,10 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
     resources = _parse_resources(raw.get("resources"))
     checks = _parse_checks(raw.get("checks"))
     effects = _parse_effects(raw.get("effects"), checks=checks, resources=resources)
+    world = _parse_world(raw.get("world"))
+    world_effects = _parse_world_effects(
+        raw.get("world_effects"), checks=checks, world=world,
+    )
     raw_fields = raw.get("authoritative_fields")
     authoritative_fields: tuple[str, ...] = ()
     if raw_fields is not None:
@@ -339,6 +545,7 @@ def parse_custom_mechanics(template: Any) -> CustomMechanics:
     return CustomMechanics(
         resources=resources, checks=checks, effects=effects,
         authoritative_fields=authoritative_fields,
+        world=world, world_effects=world_effects,
     )
 
 
@@ -351,5 +558,7 @@ __all__ = [
     "EffectSpec",
     "ResourceSpec",
     "ValueRef",
+    "WorldEffectSpec",
+    "WorldObjectSpec",
     "parse_custom_mechanics",
 ]
