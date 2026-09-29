@@ -203,7 +203,7 @@ const visibleLeveledSpells = computed(() => {
 
 function blankDraft(): Dnd2024Draft {
   return {
-    locale: props.language || props.experience.locale,
+    locale: props.language || props.experience.locale || '',
     name: '', level: 1, alignment: 'neutral_good', ability_method: 'standard_array',
     base_abilities: {}, background_ability_bonuses: {},
     class_ref: '', species_ref: '', background_ref: '',
@@ -544,7 +544,7 @@ function setFeatChoice(featRef: string, choiceId: string, value: string, count: 
 async function choosePreset(preset: RulesetQuickCharacterPreset): Promise<void> {
   const name = draft.value.name
   store.draft = {
-    ...blankDraft(), ...preset.draft, locale: props.language || props.experience.locale,
+    ...blankDraft(), ...preset.draft, locale: props.language || props.experience.locale || '',
     name,
   }
   selectedPreset.value = preset.ref

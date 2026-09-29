@@ -866,9 +866,17 @@ export type RulesetBuilderMode = 'quick' | 'guided' | 'expert'
 export interface RulesetExperience {
   profile: string
   builder_mode: RulesetRuntimeCapabilities['character_builder']
-  modes: RulesetBuilderMode[]
+  /** D&D 用三档（quick/guided/expert）。声明式规则没有模式概念，故可选。 */
+  modes?: RulesetBuilderMode[]
   content_version: string
-  locale: string
+  /** 有些运行时（如声明式规则）不按语言分发内容，故可选。 */
+  locale?: string
+  // 声明式规则（profile="custom"）额外返回的字段：
+  rule_id?: string
+  runtime_version?: number
+  authoritative_intents?: boolean
+  resources?: Array<{ id: string; name: string }>
+  checks?: Array<{ id: string; name: string; dice: string }>
 }
 
 export interface RulesetExperienceResponse {

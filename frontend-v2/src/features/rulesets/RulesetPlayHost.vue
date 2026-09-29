@@ -13,6 +13,7 @@ const props = withDefaults(defineProps<{
   activeTool: RulesetPlayTool
   hasCampaign?: boolean
   hasCombat?: boolean
+  hasRules?: boolean
   gameKey: string
   actorId: string
   characterName?: string
@@ -24,6 +25,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   hasCampaign: false,
   hasCombat: false,
+  hasRules: false,
   characterName: '',
   sceneName: '',
   worldName: '',
@@ -39,7 +41,8 @@ const emit = defineEmits<{
 const { locale } = useLocale()
 const extension = computed(() => resolveRulesetPlayExtension(props.runtimeId))
 const copy = computed(() => extension.value?.copy(String(locale.value)) || {
-  menu: 'Ruleset tools', campaign: 'Campaign', combat: 'Combat', title: 'Ruleset tools',
+  menu: 'Ruleset tools', campaign: 'Campaign', combat: 'Combat',
+  rules: 'Rules & checks', title: 'Ruleset tools',
 })
 </script>
 
@@ -57,6 +60,11 @@ const copy = computed(() => extension.value?.copy(String(locale.value)) || {
         :class="{ active: activeTool === 'combat' }"
         @click="emit('navigate', 'combat')"
       >{{ copy.combat }}</button>
+      <button
+        v-if="hasRules && extension.rules"
+        :class="{ active: activeTool === 'rules' }"
+        @click="emit('navigate', 'rules')"
+      >{{ copy.rules }}</button>
     </nav>
     <component
       :is="extension.campaign"
@@ -82,6 +90,16 @@ const copy = computed(() => extension.value?.copy(String(locale.value)) || {
       :refresh-key="refreshKey"
       @refresh="emit('refresh')"
       @navigate="emit('navigate', $event)"
+    />
+    <component
+      :is="extension.rules"
+      v-else-if="activeTool === 'rules' && hasRules && extension.rules"
+      :game-key="gameKey"
+      :actor-id="actorId"
+      :character-name="characterName"
+      :is-gm="isGm"
+      :refresh-key="refreshKey"
+      @refresh="emit('refresh')"
     />
     </div>
     <p v-else class="error-banner">

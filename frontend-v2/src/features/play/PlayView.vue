@@ -174,30 +174,39 @@ const hasCampaignGuidance = computed(() => Boolean(
   game.detail.value?.ruleset_runtime?.capabilities?.session_zero
   || game.detail.value?.ruleset_runtime?.capabilities?.tutorial_coach,
 ))
+// 「规则与检定」面板由**注册表**决定是否存在，不看能力位：
+// 能力位描述的是"规则有多权威"，不是"有没有界面"。声明式规则
+// （custom:declarative）没有战斗循环，但它的裁定才是权威的。
+const hasDeclarativeRules = computed(() => Boolean(
+  resolveRulesetPlayExtension(String(game.detail.value?.ruleset_runtime?.id || ''))?.rules,
+))
 const hasAdventureBinding = computed(() => Boolean(game.detail.value?.adventure_binding?.adventure_id))
-type RulesetTool = 'campaign' | 'combat'
+type RulesetTool = 'campaign' | 'combat' | 'rules'
 const activeRulesetTool = ref<RulesetTool | ''>('')
 const directorProposal = ref<RulesetDirectorProposal | null>(null)
 const rulesetGameplay = ref<RulesetGameplayView | null>(null)
 const rulesetCombatStatus = ref('none')
 const rulesetCampaignStatus = ref('')
 const hasCombatExtension = computed(() => Boolean(game.detail.value?.combat_extension))
-const hasProfessionalTools = computed(() => hasCampaignGuidance.value || hasAuthoritativeCombat.value)
+const hasProfessionalTools = computed(() => (
+  hasCampaignGuidance.value || hasAuthoritativeCombat.value || hasDeclarativeRules.value
+))
 // 自由规则可能只开启 combat_extension：此时 tools 栏也必须出现，否则「战斗动作」没有入口。
 const hasComposerTools = computed(() => hasProfessionalTools.value || canAskKp.value || hasCombatExtension.value)
 const rulesetToolCopy = computed(() => (
   resolveRulesetPlayExtension(String(game.detail.value?.ruleset_runtime?.id || ''))
     ?.copy(String(locale.value))
-  || { menu: 'Ruleset tools', campaign: 'Campaign', combat: 'Combat', title: 'Ruleset tools' }
+  || { menu: 'Ruleset tools', campaign: 'Campaign', combat: 'Combat', rules: 'Rules & checks', title: 'Ruleset tools' }
 ))
 function openRulesetTool(tool: RulesetTool): void {
   activeRulesetTool.value = tool
 }
 
 function navigateRulesetTool(tool: RulesetTool): void {
-  if (tool === 'campaign' ? hasCampaignGuidance.value : hasAuthoritativeCombat.value) {
-    activeRulesetTool.value = tool
-  }
+  const allowed = tool === 'campaign' ? hasCampaignGuidance.value
+    : tool === 'combat' ? hasAuthoritativeCombat.value
+      : hasDeclarativeRules.value
+  if (allowed) activeRulesetTool.value = tool
 }
 
 let rulesetToolPoll: number | undefined
@@ -1157,6 +1166,7 @@ onBeforeUnmount(() => {
         :active-tool="activeRulesetTool"
         :has-campaign="hasCampaignGuidance"
         :has-combat="hasAuthoritativeCombat"
+        :has-rules="hasDeclarativeRules"
         :game-key="game.currentGame.value"
         :actor-id="actorId"
         :character-name="game.player.value?.character_name || ''"
@@ -1282,6 +1292,15 @@ onBeforeUnmount(() => {
                 :aria-label="rulesetToolCopy.combat"
                 @click="openRulesetTool('combat')"
               ><NIcon :component="ShieldOutline" /><span>{{ rulesetToolCopy.combat }}</span></button>
+              <button
+                v-if="hasDeclarativeRules"
+                class="rules-tool-trigger"
+                data-testid="declarative-rules-tool"
+                type="button"
+                :title="rulesetToolCopy.rules"
+                :aria-label="rulesetToolCopy.rules"
+                @click="openRulesetTool('rules')"
+              ><NIcon :component="StatsChartOutline" /><span>{{ rulesetToolCopy.rules }}</span></button>
             </div>
           </template>
         </CombatMessageComposer>
@@ -1330,6 +1349,15 @@ onBeforeUnmount(() => {
                 :aria-label="rulesetToolCopy.combat"
                 @click="openRulesetTool('combat')"
               ><NIcon :component="ShieldOutline" /><span>{{ rulesetToolCopy.combat }}</span></button>
+              <button
+                v-if="hasDeclarativeRules"
+                class="rules-tool-trigger"
+                data-testid="declarative-rules-tool"
+                type="button"
+                :title="rulesetToolCopy.rules"
+                :aria-label="rulesetToolCopy.rules"
+                @click="openRulesetTool('rules')"
+              ><NIcon :component="StatsChartOutline" /><span>{{ rulesetToolCopy.rules }}</span></button>
             </div>
           </template>
         </ActionComposer>
