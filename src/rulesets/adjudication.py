@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Any, Mapping
@@ -54,6 +55,7 @@ __all__ = [
     "Risk",
     "Stakes",
     "check_resolved_event",
+    "compute_change",
     "effect_descriptors_from",
     "intent_field_violations",
     "normalize_degree",
@@ -740,6 +742,56 @@ def effect_descriptors_from(value: Any) -> tuple[EffectDescriptor, ...]:
     """
 
     return _descriptors_from(value)
+
+
+def compute_change(
+    current: Any, op: str, value: Any, *, where: str = "",
+) -> tuple[Any, bool]:
+    """算子语义的**唯一实现**：算新值，返回 ``(新值, 是否真的变了)``。
+
+    世界状态（:mod:`src.rulesets.world`）与角色活跃效果
+    （:mod:`src.rulesets.effects`）共用这一份 —— 两处各写一遍必然会漂移，
+    而且漂移的方式很隐蔽（同一个 ``upgrade`` 在两处取了不同的方向）。
+
+    不认识 / 不该出现的组合直接报错，不猜：
+
+    - ``override`` 接受任何值（包括布尔与字符串）；
+    - 其余五个算子在**布尔**字段上直接报错（布尔没有加法）；
+    - 其余五个算子要求两侧都是数值；
+    - 字符串公式（``"1d6"``）碰到非字符串当前值时报错 —— 公式必须先在
+      ``resolve_intent`` 里用服务端 RNG 解析成具体数值。
+    """
+
+    spot = where or "<value>"
+    if isinstance(value, str) and not isinstance(current, str):
+        raise AdjudicationError(
+            f"{spot} 的 value 是字符串 {value!r} 而当前值不是 —— "
+            "公式必须在 resolve_intent 里用服务端 RNG 解析成具体数值再提交"
+        )
+    if op not in EFFECT_CHANGE_OPS:
+        raise AdjudicationError(
+            f"{spot}：未知算子 {op!r}（合法值：{', '.join(EFFECT_CHANGE_OPS)}）"
+        )
+    if op == "override":
+        return deepcopy(value), value != current
+    if isinstance(current, bool) or isinstance(value, bool):
+        raise AdjudicationError(f"{spot}：布尔字段只支持 override，收到 {op!r}")
+    if not isinstance(current, (int, float)) or not isinstance(value, (int, float)):
+        raise AdjudicationError(
+            f"{spot}：{op!r} 需要两侧都是数值，收到 "
+            f"{type(current).__name__} 与 {type(value).__name__}"
+        )
+    if op == "add":
+        return current + value, True
+    if op == "subtract":
+        return current - value, True
+    if op == "multiply":
+        return current * value, True
+    if op == "upgrade":
+        # Foundry 语义：取更高者 —— D&D 的"同类加值不叠加"靠它。
+        return (value, True) if value > current else (current, False)
+    # downgrade：取更低者。
+    return (value, True) if value < current else (current, False)
 
 
 def _descriptors_from(value: Any) -> tuple[EffectDescriptor, ...]:

@@ -45,7 +45,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from src.rulesets.adjudication import EffectDescriptor
+from src.rulesets.adjudication import AdjudicationError, EffectDescriptor, compute_change
 
 __all__ = [
     "PRESENTATION_PREFIX",
@@ -60,6 +60,7 @@ __all__ = [
     "load_world",
     "read_field",
     "world_object_id",
+    "write_field",
 ]
 
 STATE_PREFIX = "state"
@@ -266,42 +267,28 @@ def _apply_tags(raw: dict[str, Any], descriptor: EffectDescriptor) -> bool:
 def _compute(
     current: Any, descriptor: EffectDescriptor, object_id: str,
 ) -> tuple[Any, bool]:
-    """算新值。返回 ``(新值, 是否变化)``。不认识的组合直接报错，不猜。"""
+    """算新值。算子语义在 :func:`adjudication.compute_change`（唯一实现）。
 
-    op = descriptor.op
-    value = descriptor.value
-    path = f"{object_id}.{descriptor.field}"
+    这里只负责把错误类型换回本层的 :class:`WorldError`，让调用方的
+    ``except WorldError`` 仍然有效。
+    """
 
-    if isinstance(value, str) and not isinstance(current, str):
-        raise WorldError(
-            f"{path} 的 value 是字符串 {value!r} 而当前值不是 —— "
-            "公式必须在 resolve_intent 里用服务端 RNG 解析成具体数值再提交"
+    try:
+        return compute_change(
+            current, descriptor.op, descriptor.value,
+            where=f"{object_id}.{descriptor.field}",
         )
+    except AdjudicationError as exc:
+        raise WorldError(str(exc)) from exc
 
-    if op == "override":
-        return deepcopy(value), value != current
 
-    if isinstance(current, bool) or isinstance(value, bool):
-        raise WorldError(f"{path}：布尔字段只支持 override，收到 {op!r}")
+def write_field(container: dict[str, Any], path: str, value: Any) -> None:
+    """按点分路径写值（中间层不存在则创建）。
 
-    if not isinstance(current, (int, float)) or not isinstance(value, (int, float)):
-        raise WorldError(
-            f"{path}：{op!r} 需要两侧都是数值，收到 "
-            f"{type(current).__name__} 与 {type(value).__name__}"
-        )
+    公开给 :mod:`src.rulesets.effects` 复用 —— 路径语义只能有一份实现。
+    """
 
-    if op == "add":
-        return current + value, True
-    if op == "subtract":
-        return current - value, True
-    if op == "multiply":
-        return current * value, True
-    if op == "upgrade":
-        # Foundry 语义：取更高者（D&D 的"取最高加值"叠法）。
-        return (value, True) if value > current else (current, False)
-    if op == "downgrade":
-        return (value, True) if value < current else (current, False)
-    raise WorldError(f"{path}：state 字段不支持算子 {op!r}")
+    _write(container, _split_path(path), value)
 
 
 def _write(container: dict[str, Any], path: list[str], value: Any) -> None:
