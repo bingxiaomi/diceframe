@@ -70,7 +70,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from src.rulesets.adjudication import EFFECT_CHANGE_OPS, ConsumptionTiming
+from src.rulesets.adjudication import (
+    EFFECT_CHANGE_OPS,
+    ConsequenceSeverity,
+    ConsumptionTiming,
+    SeverityScale,
+)
 from src.rulesets.attempts import RetryPolicy
 from src.rulesets.effects import DURATION_KINDS
 
@@ -86,6 +91,9 @@ _WORLD_FIELD_ROOTS = ("state.", "tags")
 
 #: 角色效果禁止写的字段根前缀。
 _EFFECT_FORBIDDEN_PREFIXES = ("presentation",)
+
+#: 严重度标尺用不可变对象做默认值，不用 ``field(default_factory=...)``。
+_NO_SEVERITY = SeverityScale()
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _COMPARISONS = frozenset({"lte", "gte"})
@@ -160,12 +168,32 @@ class ResourceSpec:
 
 @dataclass(frozen=True, slots=True)
 class DegreeSpec:
-    """成功度分级。``fallback=True`` 的档位必须且只能有一个，且放在最后。"""
+    """成功度分级。``fallback=True`` 的档位必须且只能有一个，且放在最后。
+
+    ``achieved``/``extent`` 把"成没成"与"成了多少"分开。不写就从结构派生：
+    **兜底档就是失败档**（解析已保证它唯一且在最后），所以其余档位默认
+    达成、程度 1.0。要表达"部分成功"就写 ``"extent": 0.5`` —— 不需要
+    发明一个新的档位名，也不需要宿主认识那个名字。
+    """
 
     id: str
     label: str
     max_ratio: float
     fallback: bool
+    #: ``None`` = 从结构派生（兜底档=False，其余=True）。
+    achieved: bool | None = None
+    #: ``None`` = 从结构派生（兜底档=0.0，其余=1.0）。
+    extent: float | None = None
+
+    @property
+    def goal_achieved(self) -> bool:
+        return (not self.fallback) if self.achieved is None else self.achieved
+
+    @property
+    def goal_extent(self) -> float:
+        if self.extent is not None:
+            return self.extent
+        return 0.0 if self.fallback else 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +213,18 @@ class CheckSpec:
     #: 默认关："试过了还要不要掷"是桌风问题，由规则作者表态，
     #: 否则会给已有规则静默加上行为变化。
     consult_attempts: bool = False
+    #: 后果严重度标尺（可选）。缺省 = 不产生严重度（``NONE``）。
+    #: **与 ``Risk`` 是两个轴**：风险动掷骰难度，严重度动"失败之后有多疼"。
+    severity: SeverityScale = _NO_SEVERITY
+
+    @property
+    def degree_order(self) -> tuple[tuple[str, bool], ...]:
+        """从好到坏排列的 ``(id, achieved)``。
+
+        严重度靠"差几档"算，不靠档位名 —— 否则每套自定义命名都得配一个公式。
+        """
+
+        return tuple((d.id, d.goal_achieved) for d in self.degrees)
 
     @property
     def failure_degree_id(self) -> str:
@@ -374,6 +414,27 @@ def _parse_resources(raw: Any) -> tuple[ResourceSpec, ...]:
     return tuple(specs)
 
 
+def _parse_achieved(item: dict[str, Any], *, where: str) -> bool | None:
+    if "achieved" not in item:
+        return None
+    value = item["achieved"]
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}.achieved 必须是布尔值")
+    return value
+
+
+def _parse_extent(item: dict[str, Any], *, where: str) -> float | None:
+    if "extent" not in item:
+        return None
+    value = item["extent"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}.extent 必须是数字")
+    extent = float(value)
+    if not 0.0 <= extent <= 1.0:
+        raise ValueError(f"{where}.extent 必须在 [0, 1] 之间")
+    return extent
+
+
 def _parse_degrees(raw: Any, *, field: str) -> tuple[DegreeSpec, ...]:
     if not isinstance(raw, list) or not raw:
         raise ValueError(f"{field} 必须是非空数组")
@@ -402,6 +463,8 @@ def _parse_degrees(raw: Any, *, field: str) -> tuple[DegreeSpec, ...]:
             label=str(item.get("label") or degree_id).strip()[:32],
             max_ratio=ratio,
             fallback=fallback,
+            achieved=_parse_achieved(item, where=f"{field}[{index}]"),
+            extent=_parse_extent(item, where=f"{field}[{index}]"),
         ))
     fallbacks = [d for d in degrees if d.fallback]
     if len(fallbacks) != 1:
@@ -411,6 +474,14 @@ def _parse_degrees(raw: Any, *, field: str) -> tuple[DegreeSpec, ...]:
     ratios = [d.max_ratio for d in degrees if not d.fallback]
     if ratios != sorted(ratios):
         raise ValueError(f"{field} 的 max_ratio 必须从小到大排列")
+    fallback_degree = degrees[-1]
+    if fallback_degree.achieved is True and fallback_degree.extent is None:
+        # 兜底档声明为"达成"是合法的（"失败但仍有收获"），但必须写清楚程度 ——
+        # 否则它会拿到派生默认的 extent 0.0，变成"达成 0%"这种自相矛盾的组合。
+        raise ValueError(
+            f"{field} 的兜底档 {fallback_degree.id!r} 声明了 achieved: true，"
+            "必须同时给出 extent（否则默认 0.0，等于「达成 0%」）"
+        )
     return tuple(degrees)
 
 
@@ -454,14 +525,44 @@ def _parse_checks(raw: Any) -> tuple[CheckSpec, ...]:
 
 _ADJUDICATION_KEYS = (
     "can_succeed", "can_fail", "failure_matters", "consult_attempts",
+    "severity", "severity_per_step",
 )
 
 
-def _parse_adjudication(raw: Any, *, where: str) -> dict[str, bool]:
+def _parse_severity_scale(raw: dict[str, Any], *, where: str) -> SeverityScale:
+    """解析 ``severity`` / ``severity_per_step``。
+
+    基础严重度是**这条规则认为"失败"该有多疼**；具体多疼由差了几档再加权。
+    """
+
+    if "severity" not in raw and "severity_per_step" not in raw:
+        return _NO_SEVERITY
+    base = _NO_SEVERITY.base
+    if "severity" in raw:
+        raw_base = str(raw["severity"] or "").strip().upper()
+        try:
+            base = ConsequenceSeverity(raw_base)
+        except ValueError as exc:
+            raise ValueError(
+                f"{where}.severity 必须是 "
+                f"{[str(s) for s in ConsequenceSeverity]} 之一: {raw_base!r}"
+            ) from exc
+    per_step = _NO_SEVERITY.per_step
+    if "severity_per_step" in raw:
+        raw_step = raw["severity_per_step"]
+        if isinstance(raw_step, bool) or not isinstance(raw_step, int):
+            raise ValueError(f"{where}.severity_per_step 必须是整数")
+        if raw_step < 0:
+            raise ValueError(f"{where}.severity_per_step 不能为负")
+        per_step = raw_step
+    return SeverityScale(base=base, per_step=per_step)
+
+
+def _parse_adjudication(raw: Any, *, where: str) -> dict[str, Any]:
     """解析检定上的 ``adjudication`` 块（可选）。
 
-    这三项决定**要不要掷骰**，而掷骰前还不知道成功度，所以必须由规则作者
-    表态；缺省全部 ``true`` = 保持"总是骰"的原行为。
+    前四项决定**要不要掷骰**，而掷骰前还不知道成功度，所以必须由规则作者
+    表态；缺省全部 ``true`` = 保持"总是骰"的原行为。后两项是后果严重度。
     """
 
     if raw is None:
@@ -473,13 +574,16 @@ def _parse_adjudication(raw: Any, *, where: str) -> dict[str, bool]:
         raise ValueError(
             f"{where} 含未知字段 {unknown}（只支持 {list(_ADJUDICATION_KEYS)}）"
         )
-    parsed: dict[str, bool] = {}
-    for key in _ADJUDICATION_KEYS:
+    parsed: dict[str, Any] = {}
+    for key in ("can_succeed", "can_fail", "failure_matters", "consult_attempts"):
         if key not in raw:
             continue
         if not isinstance(raw[key], bool):
             raise ValueError(f"{where}.{key} 必须是布尔值")
         parsed[key] = raw[key]
+    scale = _parse_severity_scale(raw, where=where)
+    if scale != _NO_SEVERITY:
+        parsed["severity"] = scale
     return parsed
 
 

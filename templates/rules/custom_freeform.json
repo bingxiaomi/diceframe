@@ -105,9 +105,11 @@
         "comparison": "lte",
         "target": {"constant": 40},
         "degrees": [
-          {"id": "opened", "label": "打开", "max_ratio": 1.0},
+          {"id": "opened", "label": "打开", "max_ratio": 0.5},
+          {"id": "ajar", "label": "撑开一条缝", "max_ratio": 0.9, "extent": 0.5},
           {"id": "jammed", "label": "卡住", "fallback": true}
-        ]
+        ],
+        "adjudication": {"severity": "MINOR", "severity_per_step": 1}
       }
     ],
     "effects": [

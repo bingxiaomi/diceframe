@@ -34,9 +34,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 __all__ = [
     "ACTIVITY_TYPES",
@@ -57,9 +57,18 @@ __all__ = [
     "Stakes",
     "check_resolved_event",
     "compute_change",
+    "ConsequenceSeverity",
+    "CostLine",
+    "GoalOutcome",
+    "OutcomeBreakdown",
+    "RuleTrace",
+    "SeverityScale",
+    "TraceEntry",
     "effect_descriptors_from",
     "intent_field_violations",
     "normalize_degree",
+    "severity_for_degree",
+    "steps_below_success",
     "three_question_resolution",
 ]
 
@@ -873,3 +882,259 @@ def _competence_level(value: Any) -> CompetenceLevel:
         return CompetenceLevel(str(value or "").strip().upper())
     except ValueError:
         return CompetenceLevel.UNTRAINED
+
+
+# ---------------------------------------------------------------------------
+# 7. 结果分解：把"部分成功"从一个魔法枚举拆成两个问题
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class GoalOutcome:
+    """目标达成情况：**成没成**（``achieved``）与**成了多少**（``extent``）。
+
+    这两件事本来就是分开的，而"部分成功"这种档位名把它们压成了一个枚举值 ——
+    于是每一本规则书都要自己发明一套名字（raise a consequence / success with
+    cost / mixed result），而宿主并不知道那些名字之间是什么关系。
+    """
+
+    achieved: bool
+    extent: float = 1.0
+
+    @property
+    def partial(self) -> bool:
+        """达成了一部分 —— 这才是 ``PARTIAL_SUCCESS`` 真正想说的东西。"""
+
+        return self.achieved and 0.0 < self.extent < 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "achieved": self.achieved,
+            "extent": self.extent,
+            "partial": self.partial,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CostLine:
+    """一笔代价的**事实**（不是声明）。声明在 ``custom_mechanics.consumptions``。"""
+
+    resource: str
+    amount: int
+    timing: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resource": self.resource,
+            "amount": self.amount,
+            "timing": self.timing,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomeBreakdown:
+    """一次裁定的完整结果：档位 + 目标达成 + 严重度 + 代价。
+
+    ``degree`` 只作为**规则书自己的名字**保留（用于显示与翻译），判断不该读它
+    —— 该读的是 ``goal`` 与 ``severity``。
+    """
+
+    degree: str
+    degree_label: str
+    resolution: str
+    goal: GoalOutcome
+    severity: str
+    costs: tuple[CostLine, ...] = ()
+
+    @classmethod
+    def from_degree(
+        cls, *, degree_id: str, degree_label: str, resolution: Any,
+        achieved: bool, extent: float, severity: Any = None,
+    ) -> OutcomeBreakdown:
+        return cls(
+            degree=degree_id,
+            degree_label=degree_label,
+            resolution=str(resolution),
+            goal=GoalOutcome(achieved=achieved, extent=extent),
+            severity=str(severity or ConsequenceSeverity.NONE),
+        )
+
+    def with_costs(self, costs: Sequence[CostLine]) -> OutcomeBreakdown:
+        return replace(self, costs=tuple(costs))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "degree": self.degree,
+            "degree_label": self.degree_label,
+            "resolution": self.resolution,
+            "goal": self.goal.to_dict(),
+            "severity": self.severity,
+            "costs": [cost.to_dict() for cost in self.costs],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 8. 后果严重度：与"风险"互不重叠的两个轴
+# ---------------------------------------------------------------------------
+class ConsequenceSeverity(StrEnum):
+    """后果落在角色身上的量级。
+
+    **与 ``Risk`` 是两个轴**：``Risk`` 动的是"掷骰难不难"（DC / 优势），
+    严重度动的是"失败之后有多疼"。风险同时抬这两个 = 同一个原因被计了两遍，
+    而且玩家感觉不到"这次为什么这么疼"。
+    """
+
+    NONE = "NONE"
+    MINOR = "MINOR"
+    MAJOR = "MAJOR"
+    SEVERE = "SEVERE"
+
+    @property
+    def rank(self) -> int:
+        return _SEVERITY_ORDER.index(self)
+
+
+_SEVERITY_ORDER: tuple[ConsequenceSeverity, ...] = (
+    ConsequenceSeverity.NONE,
+    ConsequenceSeverity.MINOR,
+    ConsequenceSeverity.MAJOR,
+    ConsequenceSeverity.SEVERE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SeverityScale:
+    """基础严重度 + 每差一档抬几级。**从差多少派生，不从档位名派生。**
+
+    ``per_step`` 默认 **0**：不声明就不升级。给个"合理默认"会让所有没写
+    这条声明的检定突然开始产生后果严重度 —— 那是替规则作者改规则。
+    """
+
+    base: ConsequenceSeverity = ConsequenceSeverity.NONE
+    per_step: int = 0
+
+    def raise_by(self, steps: int) -> ConsequenceSeverity:
+        index = self.base.rank + max(0, int(steps)) * self.per_step
+        return _SEVERITY_ORDER[max(0, min(len(_SEVERITY_ORDER) - 1, index))]
+
+    def resolve(self, *, degree_steps_below: int) -> ConsequenceSeverity:
+        """``degree_steps_below``：1 = 刚好失败（最浅的失败），2 = 再差一档……
+
+        减 1 是为了让 ``base`` 落在"刚好失败"上 —— 否则 ``base`` 永远不会
+        被用到（``steps=0`` 意味着成功，而成功的后果无所谓严重度）。
+        """
+
+        return self.raise_by(max(0, int(degree_steps_below) - 1))
+
+
+def steps_below_success(
+    degrees: Sequence[tuple[str, bool]], degree_id: str,
+) -> int:
+    """比**最差的那个成功档**还差几级。0 = 成功或更好。
+
+    ``degrees`` 是按"从好到坏"排列的 ``(id, achieved)``。用"差多少"而不是
+    "叫什么名字"，是为了让同一个严重度公式能套在任何一套自定义档位名上。
+    """
+
+    worst_success = -1
+    for index, (_id, achieved) in enumerate(degrees):
+        if achieved:
+            worst_success = index
+    for index, (current_id, _achieved) in enumerate(degrees):
+        if current_id == degree_id:
+            return max(0, index - worst_success)
+    return 0
+
+
+def severity_for_degree(
+    degree_id: str,
+    degrees: Sequence[tuple[str, bool]],
+    scale: SeverityScale,
+    *,
+    risk: Any = None,
+) -> ConsequenceSeverity:
+    """后果严重度 = 基础严重度 + 差了几档。**没失败就没有严重度。**
+
+    ``risk`` 被**接受但忽略**：调用方手上通常正好有风险对象，如果签名里没有
+    这个参数，调用方就会在外面自己抬一档 —— 那才是双重计价真正发生的地方。
+    放在签名里并给出结论，会让"我该不该在这里再加一点"变成一个有答案的问题。
+    """
+
+    del risk  # 见 docstring：这是刻意的
+    steps = steps_below_success(degrees, degree_id)
+    if steps <= 0:
+        # 目标达成了就没有"后果"这回事 —— "成功的后果有多严重"不是一个
+        # 有意义的问题。部分达成也不算失败，它的程度由 ``extent`` 表达。
+        return ConsequenceSeverity.NONE
+    return scale.resolve(degree_steps_below=steps)
+
+
+# ---------------------------------------------------------------------------
+# 9. 规则追踪：这一次裁定里，哪条规则为什么触发了
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class TraceEntry:
+    """一个触发点。``rule`` 是来源标识，``kind`` 是阶段。"""
+
+    rule: str
+    kind: str
+    reason: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule": self.rule,
+            "kind": self.kind,
+            "reason": self.reason,
+            "detail": deepcopy(self.detail),
+        }
+
+
+#: ``TraceEntry.kind`` 的取值。刻意保持很窄 —— 追踪条目一多就没人看了。
+TRACE_KINDS = (
+    "pre_roll",     # 骰前三问 / 尝试账本判定
+    "roll",         # 掷骰与取目标数
+    "degree",       # 档位判定
+    "consumption",  # 代价
+    "effect",       # 角色效果
+    "world",        # 世界变更
+    "attempt",      # 尝试记账
+    "severity",     # 后果严重度
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RuleTrace:
+    """一次裁定的完整推理链。
+
+    存在的理由很实际：规则声明越来越厚之后，"为什么这次掷骰目标数是 39"
+    光看结果根本答不上来。前端把它展开给玩家看，GM 模型靠它解释，
+    规则作者靠它调试自己写的声明。
+    """
+
+    entries: tuple[TraceEntry, ...] = ()
+
+    def add(
+        self, rule: str, kind: str, reason: str = "", **detail: Any,
+    ) -> RuleTrace:
+        if kind not in TRACE_KINDS:
+            raise AdjudicationError(
+                f"未知的追踪阶段 {kind!r}（合法值：{', '.join(TRACE_KINDS)}）"
+            )
+        return RuleTrace((
+            *self.entries,
+            TraceEntry(rule=rule, kind=kind, reason=reason, detail=detail),
+        ))
+
+    def of_kind(self, kind: str) -> tuple[TraceEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.kind == kind)
+
+    def to_list(self) -> list[dict[str, Any]]:
+        return [entry.to_dict() for entry in self.entries]
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __bool__(self) -> bool:
+        return bool(self.entries)
+

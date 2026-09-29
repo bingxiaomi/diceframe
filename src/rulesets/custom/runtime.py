@@ -41,11 +41,15 @@ from uuid import uuid4
 
 from src.rulesets.adjudication import (
     CONSUMPTION_FAILED,
+    CostLine,
+    OutcomeBreakdown,
     Resolution,
+    RuleTrace,
     consumption_charges,
     consumption_checked_before_roll,
     effect_descriptors_from,
     intent_field_violations,
+    severity_for_degree,
 )
 from src.rulesets.attempts import RetryPolicy
 from src.rulesets.attempts import failure_sticks as evaluate_failure_sticks
@@ -491,10 +495,11 @@ def _world_effect_payload(spec: Any, rng: Any) -> dict[str, Any]:
 
 def _short_circuit_batch(
     actor: str, intent_type: str, uid: str, check: Any,
-    verdict: tuple[Any, list[str]],
+    verdict: tuple[Any, list[str], str],
     extra: list[dict[str, Any]] | None = None,
+    trace: RuleTrace | None = None,
 ) -> dict[str, Any]:
-    """不掷骰的裁定：记下裁定本身，外加**骰前就该发生的**代价。
+    """不掷骰的裁定：记下裁定本身、推理链，外加**骰前就该发生的**代价。
 
     **刻意不产成功度效果**：``AUTO_SUCCESS`` 该落哪个档位的效果，是规则作者
     该表态的事（需要类似 ``auto_success_degree`` 的声明）；现在自己挑一档
@@ -507,27 +512,34 @@ def _short_circuit_batch(
     所以不打破任何现有路径，叙事层靠 ``resolution`` 与 ``reason`` 工作。
     """
 
-    resolution, reasons = verdict
+    resolution, reasons, _rule = verdict
+    record: dict[str, Any] = {
+        "type": "custom.check.resolved",
+        "actor_id": uid,
+        "check_id": str(getattr(check, "id", "")),
+        "resolution": str(resolution),
+        "reason": list(reasons),
+    }
+    if trace:
+        record["trace"] = trace.to_list()
     return {
         "ok": True,
         "event_batch": {
             "batch_id": uuid4().hex,
             "intent_type": intent_type,
             "actor_id": actor,
-            "events": [
-                *list(extra or ()),
-                {
-                    "type": "custom.check.resolved",
-                    "actor_id": uid,
-                    "check_id": str(getattr(check, "id", "")),
-                    "resolution": str(resolution),
-                    "reason": list(reasons),
-                },
-            ],
+            "events": [*list(extra or ()), record],
         },
         "replayed": False,
         "pending_decision": None,
     }
+
+
+def _find_degree(check: Any, degree_id: str) -> Any:
+    for degree in getattr(check, "degrees", ()) or ():
+        if degree.id == degree_id:
+            return degree
+    return None
 
 
 def _seed_world(raw_world: dict[str, Any], seed: dict[str, dict[str, Any]]) -> None:
@@ -901,6 +913,7 @@ class CustomDeclarativeRuntime:
             if check is None:  # validate_intent 已挡；保持 fail-closed。
                 return {"ok": False, "code": "UNKNOWN_CHECK", "error": "未声明的检定"}
             consumptions = mechanics.consumptions_for(check.id)
+            trace = RuleTrace()
             # 骰前可负担性检查：不能先掷骰再发现扣不起 —— 那就等于白赚一次掷骰，
             # 而且玩家已经看到结果了，再告诉他"其实不行"是无法接受的。
             short_of = self._unaffordable(instance, uid, consumptions)
@@ -913,14 +926,28 @@ class CustomDeclarativeRuntime:
                         f"资源 {resource_id} 不足：需要 {amount}，只有 {have}"
                     ),
                 }
+            for spec in consumptions:
+                if consumption_checked_before_roll(spec.timing):
+                    trace = trace.add(
+                        f"consumption:{spec.resource}", "pre_roll",
+                        f"{spec.timing} 的代价在掷骰前就要付，已确认付得起",
+                        timing=spec.timing, amount=spec.amount,
+                    )
             short = self._pre_roll_verdict(instance, mechanics, check, uid)
             if short is not None:
                 # 不掷骰。ON_DECLARE 仍要付（"我试了"已经发生），其余不付。
+                resolution, reasons, rule = short
+                trace = trace.add(
+                    rule, "pre_roll", "; ".join(reasons),
+                    resolution=str(resolution),
+                )
+                extra, _costs, trace = self._consumption_events(
+                    mechanics, check, uid,
+                    rolled=False, succeeded=False, trace=trace,
+                )
                 return _short_circuit_batch(
                     actor, intent_type, uid, check, short,
-                    extra=self._consumption_events(
-                        mechanics, check, uid, rolled=False, succeeded=False,
-                    ),
+                    extra=extra, trace=trace,
                 )
             # 取**有效值**而不是基础值：挂着的效果必须真的影响这次检定的目标数，
             # 否则"效果生效了"就只是个账面数字。
@@ -928,18 +955,49 @@ class CustomDeclarativeRuntime:
             target = custom_state.resolve_target(
                 mechanics, self._sheet(instance, uid), ref=check.target, resources=resources,
             )
+            trace = trace.add(
+                "check.target", "roll",
+                f"目标数 {target}（取自有效值：基础值 + 活跃效果）",
+                check_id=check.id, target=target, dice=check.dice,
+                resources=deepcopy(resources),
+            )
             outcome = resolve_check(rng, check, target=target)
+            degree = _find_degree(check, outcome.degree_id)
+            achieved = degree.goal_achieved if degree is not None else outcome.is_success
+            extent = degree.goal_extent if degree is not None else (1.0 if achieved else 0.0)
+            severity = severity_for_degree(
+                outcome.degree_id, check.degree_order, check.severity,
+            )
+            ratio = (outcome.roll.total / target) if target else 0.0
+            trace = trace.add(
+                "check.degree", "degree",
+                f"{outcome.roll.total} / {target} = {ratio:.2f} → {outcome.degree_label}",
+                degree=outcome.degree_id, degree_label=outcome.degree_label,
+                achieved=achieved, extent=extent, severity=str(severity),
+            )
+            # 消耗排在奖励前面：**先付钱再拿东西**。反过来的话，资源已满时
+            # 奖励会被上限截掉一段，紧接着再扣，就白亏了。
+            consumption_events, cost_lines, trace = self._consumption_events(
+                mechanics, check, uid, rolled=True, succeeded=achieved, trace=trace,
+            )
+            breakdown = OutcomeBreakdown.from_degree(
+                degree_id=outcome.degree_id,
+                degree_label=outcome.degree_label,
+                resolution=Resolution.CHECK_REQUIRED,
+                achieved=achieved,
+                extent=extent,
+                severity=severity,
+            ).with_costs(cost_lines)
             events.append({
                 "type": "custom.check.resolved",
                 "actor_id": uid,
                 **outcome.to_dict(),
+                # 结果分解：成没成 / 成多少 / 有多疼 / 付了什么。
+                "outcome": breakdown.to_dict(),
+                # 推理链：这一次裁定里哪条规则为什么触发。
+                "trace": trace.to_list(),
             })
-            # 消耗排在奖励前面：**先付钱再拿东西**。反过来的话，资源已满时
-            # 奖励会被上限截掉一段，紧接着再扣，就白亏了。
-            events.extend(self._consumption_events(
-                mechanics, check, uid,
-                rolled=True, succeeded=outcome.degree_id != check.failure_degree_id,
-            ))
+            events.extend(consumption_events)
             for effect in mechanics.effects:
                 if effect.check != check.id or effect.degree != outcome.degree_id:
                     continue
@@ -1263,16 +1321,23 @@ class CustomDeclarativeRuntime:
         """
 
         if not check.can_succeed:
-            return (Resolution.IMPOSSIBLE, ["规则声明：这个办法不可能成功"])
+            return (
+                Resolution.IMPOSSIBLE,
+                ["规则声明：这个办法不可能成功"],
+                "adjudication.can_succeed",
+            )
         if not check.can_fail:
             return (
                 Resolution.AUTO_SUCCESS,
                 ["规则声明：这个办法不会失败，不需要掷骰"],
+                "adjudication.can_fail",
             )
         if not check.failure_matters:
-            return (Resolution.AUTO_SUCCESS, [
-                "规则声明：失败不留痕迹、可以无限重试 —— 这个骰子没有意义",
-            ])
+            return (
+                Resolution.AUTO_SUCCESS,
+                ["规则声明：失败不留痕迹、可以无限重试 —— 这个骰子没有意义"],
+                "adjudication.failure_matters",
+            )
         if not check.consult_attempts:
             return None
         for family, approach, target in mechanics.action_keys(check.id):
@@ -1284,6 +1349,7 @@ class CustomDeclarativeRuntime:
                 return (
                     Resolution.AUTO_FAILURE,
                     [f"尝试账本：{status.get('reason')}"],
+                    "attempts.retry_policy",
                 )
         return None
 
@@ -1501,19 +1567,25 @@ class CustomDeclarativeRuntime:
     @staticmethod
     def _consumption_events(
         mechanics: CustomMechanics, check: Any, uid: str, *,
-        rolled: bool, succeeded: bool,
-    ) -> list[dict[str, Any]]:
-        """按时机产出消耗事件。
+        rolled: bool, succeeded: bool, trace: RuleTrace,
+    ) -> tuple[list[dict[str, Any]], list[CostLine], RuleTrace]:
+        """按时机产出消耗事件 + 代价账 + 追踪条目。
 
         不产就不产 —— 该不该扣完全由 ``consumption_charges`` 决定，
         这里不做任何自己的判断（否则扣费点会长出第二套时机语义）。
         """
 
         events: list[dict[str, Any]] = []
+        costs: list[CostLine] = []
         for spec in mechanics.consumptions_for(str(getattr(check, "id", ""))):
             if not consumption_charges(
                 spec.timing, rolled=rolled, succeeded=succeeded,
             ):
+                reason = f"{spec.timing}：这次裁定不满足扣费条件"
+                trace = trace.add(
+                    f"consumption:{spec.resource}", "consumption", reason,
+                    timing=spec.timing, amount=spec.amount, charged=False,
+                )
                 continue
             events.append({
                 "type": "custom.resource.changed",
@@ -1522,7 +1594,17 @@ class CustomDeclarativeRuntime:
                 "delta": -int(spec.amount),
                 "reason": f"消耗：{spec.label or spec.resource}",
             })
-        return events
+            label = f"消耗：{spec.label or spec.resource}"
+            costs.append(CostLine(
+                resource=spec.resource, amount=int(spec.amount),
+                timing=spec.timing, reason=label,
+            ))
+            trace = trace.add(
+                f"consumption:{spec.resource}", "consumption",
+                f"{spec.timing} 触发，扣 {spec.amount}",
+                timing=spec.timing, amount=spec.amount, charged=True,
+            )
+        return events, costs, trace
 
     def _unaffordable(
         self, instance: Any, uid: str, consumptions: tuple[Any, ...],
