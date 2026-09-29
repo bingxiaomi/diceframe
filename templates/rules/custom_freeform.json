@@ -1,0 +1,84 @@
+{
+  "extends": "intents_base",
+  "rule_version": "1.0",
+  "rule_id": "custom_freeform",
+  "rule_name": "自定义规则（自由编写）",
+  "rule_name_en": "Custom Freeform Rules",
+  "description": "绑定 custom:declarative 运行时的模板规则：资源、检定与成功度全部由 JSON 声明，无需改引擎代码。",
+  "mechanics": "custom_declarative_core",
+  "ruleset_level": "assisted",
+  "runtime": {
+    "id": "custom:declarative",
+    "minimum_version": 1
+  },
+  "dice_system": "d20",
+  "combat_model": "lethal_narrative",
+  "attributes": [
+    {"key": "str", "name": "力量", "min": 3, "max": 18},
+    {"key": "dex", "name": "敏捷", "min": 3, "max": 18},
+    {"key": "con", "name": "体质", "min": 3, "max": 18},
+    {"key": "int", "name": "智力", "min": 3, "max": 18},
+    {"key": "wis", "name": "感知", "min": 3, "max": 18},
+    {"key": "cha", "name": "魅力", "min": 3, "max": 18}
+  ],
+  "special_stats": [],
+  "attribute_points": 60,
+  "attr_hint": "属性使用 3-18 数值，10 约等于普通人水平，14 以上代表明显擅长。",
+  "check_mechanic": {
+    "dice": "d20",
+    "comparison": "roll_plus_modifier_gte_target",
+    "critical": {"success": 20, "failure": 1},
+    "advantage": {
+      "type": "d20_keep_high_low",
+      "allow_explicit": true,
+      "assistance_grants": "advantage"
+    }
+  },
+  "max_check_dc": 20,
+  "dc_table": {"easy": 10, "normal": 15, "hard": 20, "extreme": 25},
+  "difficulty_dc_modifiers": {"轻松": -2, "标准": 0, "硬核": 2},
+  "hp_formula": "5 + con * 3",
+  "max_skills": 4,
+  "skill_point_total": 240,
+  "max_skill_value": 80,
+  "skill_mode": "narrative",
+  "skill_hint": "技能用来说明角色擅长什么，可写“技能名(20-80)”或只写技能名。",
+  "currency": "金币",
+  "gm_prompt_appendix": "本局使用自定义规则。GM 只叙述已经结算的结果，不得自行发明或修改机制数值；需要检定时由系统掷骰并给出成功度。",
+  "difficulty_instructions": {
+    "轻松": "描述宽容，失败也给出可行线索。",
+    "标准": "失败有明确代价，但不轻易致死。",
+    "硬核": "资源紧张，失败代价高，死亡真实。"
+  },
+  "custom_mechanics": {
+    "resources": [
+      {
+        "id": "resolve",
+        "name": "意志值",
+        "default": 50,
+        "initial": {"constant": 50},
+        "max": {"constant": 99}
+      }
+    ],
+    "checks": [
+      {
+        "id": "will_check",
+        "name": "意志检定",
+        "dice": "1d100",
+        "comparison": "lte",
+        "target": {"resource": "resolve"},
+        "degrees": [
+          {"id": "extreme", "label": "极难成功", "max_ratio": 0.2},
+          {"id": "hard", "label": "困难成功", "max_ratio": 0.5},
+          {"id": "success", "label": "成功", "max_ratio": 1.0},
+          {"id": "failure", "label": "失败", "fallback": true}
+        ]
+      }
+    ],
+    "effects": [
+      {"check": "will_check", "degree": "failure", "resource": "resolve", "delta": "-1d6"},
+      {"check": "will_check", "degree": "extreme", "resource": "resolve", "delta": "1"}
+    ],
+    "authoritative_fields": ["resources", "attributes", "skills"]
+  }
+}
