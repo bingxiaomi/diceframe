@@ -172,6 +172,15 @@ class CheckSpec:
     comparison: str
     target: ValueRef
     degrees: tuple[DegreeSpec, ...]
+    #: 三问法里**掷骰前**就能回答的两问（加第三问）。掷骰前还不知道成功度，
+    #: 所以这三项只能由规则作者表态，不能从世界状态推。
+    can_succeed: bool = True
+    can_fail: bool = True
+    failure_matters: bool = True
+    #: 是否让**尝试账本**参与骰前判定（账本可用尽则不再掷骰）。
+    #: 默认关："试过了还要不要掷"是桌风问题，由规则作者表态，
+    #: 否则会给已有规则静默加上行为变化。
+    consult_attempts: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +236,22 @@ class CustomMechanics:
     @property
     def is_empty(self) -> bool:
         return not (self.resources or self.checks or self.effects)
+
+    def action_keys(self, check_id: str) -> tuple[tuple[str, str, str], ...]:
+        """某个检定关联的 ``(intent_family, approach_signature, target)`` 组合。
+
+        从 ``world_effects`` **派生**，不是另一处声明 —— 骰前判定与尝试记账
+        必须看同一组 key，否则会出现"记了但查不到"。
+        """
+
+        seen: dict[tuple[str, str, str], None] = {}
+        for spec in self.world_effects:
+            if spec.check != check_id or not spec.intent_family:
+                continue
+            seen.setdefault(
+                (spec.intent_family, spec.approach_signature, spec.target), None,
+            )
+        return tuple(seen)
 
     def world_seed(self) -> dict[str, dict[str, Any]]:
         """初始对象表（JSON 安全），供首次播种使用。
@@ -362,8 +387,40 @@ def _parse_checks(raw: Any) -> tuple[CheckSpec, ...]:
                 item.get("target", {"constant": 50}), field=f"checks[{index}].target",
             ),
             degrees=_parse_degrees(item.get("degrees"), field=f"checks[{index}].degrees"),
+            **_parse_adjudication(item.get("adjudication"), where=f"checks[{index}].adjudication"),
         ))
     return tuple(specs)
+
+
+_ADJUDICATION_KEYS = (
+    "can_succeed", "can_fail", "failure_matters", "consult_attempts",
+)
+
+
+def _parse_adjudication(raw: Any, *, where: str) -> dict[str, bool]:
+    """解析检定上的 ``adjudication`` 块（可选）。
+
+    这三项决定**要不要掷骰**，而掷骰前还不知道成功度，所以必须由规则作者
+    表态；缺省全部 ``true`` = 保持"总是骰"的原行为。
+    """
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} 必须是对象")
+    unknown = sorted(set(raw) - set(_ADJUDICATION_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{where} 含未知字段 {unknown}（只支持 {list(_ADJUDICATION_KEYS)}）"
+        )
+    parsed: dict[str, bool] = {}
+    for key in _ADJUDICATION_KEYS:
+        if key not in raw:
+            continue
+        if not isinstance(raw[key], bool):
+            raise ValueError(f"{where}.{key} 必须是布尔值")
+        parsed[key] = raw[key]
+    return parsed
 
 
 def _parse_effects(raw: Any, *, checks: tuple[CheckSpec, ...],

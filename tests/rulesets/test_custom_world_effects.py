@@ -94,9 +94,9 @@ def _ready(runtime, rule, tmp_path: Path, key: str = "w1"):
     return instance
 
 
-def _submit(runtime, instance, rng) -> dict:
+def _submit(runtime, instance, rng, check_id: str = "will_check") -> dict:
     intent = runtime.prepare_intent_submission(
-        {"type": "custom.check.roll", "check_id": "will_check"}, UID, False,
+        {"type": "custom.check.roll", "check_id": check_id}, UID, False,
     )
     resolved = runtime.resolve_intent(instance, intent, rng)
     assert resolved["ok"] is True, resolved
@@ -404,3 +404,91 @@ def test_retry_status_on_empty_history_is_conservative(runtime, rule, tmp_path) 
     assert status["allowed"] is True
     assert status["attempt"] is None
     assert status["failure_matters"] is True, "没有证据时不能替规则文本下结论"
+
+
+# ---------------------------------------------------------------------------
+# 4. 骰前裁定：声明的三问法真的会拦住掷骰
+# ---------------------------------------------------------------------------
+def test_declared_failure_matters_false_skips_the_roll(runtime, rule, tmp_path) -> None:
+    """"失败不留痕、可以无限重试" → 直接成功，不再刷骰。
+
+    这是 D&D 2024 基础规则里"打开一扇没锁的门不需要检定"的程序化版本。
+    """
+
+    instance = _ready(runtime, rule, tmp_path, "nodice")
+    applied = _submit(runtime, instance, _FixedRng(1), check_id="search_room")
+
+    recorded = applied["recorded_events"]
+    assert recorded and recorded[0]["resolution"] == "AUTO_SUCCESS"
+    assert recorded[0]["reason"], "必须给出人话理由，否则叙事层无从解释"
+    assert "degree" not in recorded[0], "没有掷骰，就不该有成功度"
+    assert applied["changed_state"] is False, "本片刻意不产效果"
+
+
+def test_declared_can_succeed_false_is_impossible(runtime, rule, tmp_path) -> None:
+    """"徒手推倒城墙" → IMPOSSIBLE，不掷骰。"""
+
+    instance = _ready(runtime, rule, tmp_path, "wall")
+    applied = _submit(runtime, instance, _FixedRng(1), check_id="break_wall")
+
+    recorded = applied["recorded_events"]
+    assert recorded and recorded[0]["resolution"] == "IMPOSSIBLE"
+    assert "degree" not in recorded[0]
+
+
+def test_without_declaration_the_dice_still_roll(runtime, rule, tmp_path) -> None:
+    """没声明 ``adjudication`` 的检定行为**不变** —— 不能默默改变已有规则。"""
+
+    instance = _ready(runtime, rule, tmp_path, "unchanged")
+    for _ in range(3):
+        applied = _submit(runtime, instance, _FixedRng(1))
+        recorded = applied["recorded_events"]
+        assert "resolution" not in recorded[0], "走的仍是掷骰路径"
+        assert recorded[0]["degree"]
+
+
+def test_adjudication_block_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="含未知字段"):
+        parse_custom_mechanics({"custom_mechanics": {"checks": [{
+            "id": "c1",
+            "degrees": [
+                {"id": "ok", "max_ratio": 1.0},
+                {"id": "bad", "fallback": True},
+            ],
+            "adjudication": {"failure_matters": False, "whatever": True},
+        }]}})
+
+
+def test_adjudication_values_must_be_boolean() -> None:
+    with pytest.raises(ValueError, match="必须是布尔值"):
+        parse_custom_mechanics({"custom_mechanics": {"checks": [{
+            "id": "c1",
+            "degrees": [
+                {"id": "ok", "max_ratio": 1.0},
+                {"id": "bad", "fallback": True},
+            ],
+            "adjudication": {"can_fail": "no"},
+        }]}})
+
+
+def test_consult_attempts_defaults_off() -> None:
+    """"试过了还要不要掷"是桌风问题，不能默认改变行为。"""
+
+    mechanics = parse_custom_mechanics(_mechanics())
+    assert mechanics.checks[0].consult_attempts is False
+    assert mechanics.checks[0].can_succeed is True
+    assert mechanics.checks[0].can_fail is True
+    assert mechanics.checks[0].failure_matters is True
+
+
+def test_action_keys_are_derived_from_world_effects() -> None:
+    """骰前判定与尝试记账必须看同一组 key —— 所以它是派生的，不是另一处声明。"""
+
+    mechanics = parse_custom_mechanics(_mechanics(world_effects=[{
+        "check": "c1", "degree": "good", "target": "box",
+        "field": "state.open", "op": "override", "value": True,
+        "intent_family": "open", "approach_signature": "force",
+        "retry_policy": "REQUIRES_CHANGED_CIRCUMSTANCE",
+    }]))
+    assert mechanics.action_keys("c1") == (("open", "force", "box"),)
+    assert mechanics.action_keys("other") == ()

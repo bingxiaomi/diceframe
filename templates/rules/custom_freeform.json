@@ -73,6 +73,30 @@
           {"id": "success", "label": "成功", "max_ratio": 1.0},
           {"id": "failure", "label": "失败", "fallback": true}
         ]
+      },
+      {
+        "id": "search_room",
+        "name": "搜查房间",
+        "dice": "1d100",
+        "comparison": "lte",
+        "target": {"constant": 60},
+        "degrees": [
+          {"id": "found", "label": "找到", "max_ratio": 1.0},
+          {"id": "missed", "label": "没找到", "fallback": true}
+        ],
+        "adjudication": {"failure_matters": false}
+      },
+      {
+        "id": "break_wall",
+        "name": "徒手推倒城墙",
+        "dice": "1d100",
+        "comparison": "lte",
+        "target": {"constant": 5},
+        "degrees": [
+          {"id": "cracked", "label": "推裂", "max_ratio": 1.0},
+          {"id": "nothing", "label": "纹丝不动", "fallback": true}
+        ],
+        "adjudication": {"can_succeed": false}
       }
     ],
     "effects": [

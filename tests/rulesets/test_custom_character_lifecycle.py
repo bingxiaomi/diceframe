@@ -279,8 +279,8 @@ def test_gameplay_reads_declaration_from_seat_sheet(runtime, rule, tmp_path) -> 
     assert "mechanics" not in instance.ruleset_state
 
     intents = runtime.available_intents(instance, UID)
-    assert [item["type"] for item in intents] == ["custom.check.roll"]
-    assert [item["check_id"] for item in intents] == ["will_check"]
+    assert {item["type"] for item in intents} == {"custom.check.roll"}
+    assert "will_check" in [item["check_id"] for item in intents]
 
     # 读路径不能在写锁之外改状态
     assert "mechanics" not in instance.ruleset_state
@@ -346,7 +346,7 @@ def test_stage_b_pipeline_needs_no_manual_seed(runtime, rule, tmp_path) -> None:
     _join(instance, card, runtime=runtime)
 
     intents = runtime.available_intents(instance, UID)
-    assert [item["check_id"] for item in intents] == ["will_check"]
+    assert "will_check" in [item["check_id"] for item in intents]
 
     intent = runtime.prepare_intent_submission(
         {"type": "custom.check.roll", "check_id": "will_check"}, UID, False,

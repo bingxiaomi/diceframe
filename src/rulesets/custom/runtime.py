@@ -39,7 +39,7 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from src.rulesets.adjudication import effect_descriptors_from, intent_field_violations
+from src.rulesets.adjudication import Resolution, effect_descriptors_from, intent_field_violations
 from src.rulesets.attempts import RetryPolicy
 from src.rulesets.attempts import failure_sticks as evaluate_failure_sticks
 from src.rulesets.attempts import record_attempt as record_attempt_entry
@@ -471,6 +471,40 @@ def _world_effect_payload(spec: Any, rng: Any) -> dict[str, Any]:
     }
 
 
+def _short_circuit_batch(
+    actor: str, intent_type: str, uid: str, check: Any,
+    verdict: tuple[Any, list[str]],
+) -> dict[str, Any]:
+    """不掷骰的裁定：只记下裁定本身。
+
+    **刻意不产效果**：``AUTO_SUCCESS`` 该落哪个档位的效果，是规则作者该表态
+    的事（需要类似 ``auto_success_degree`` 的声明）；现在自己挑一档就是发明规则。
+    本片的目标是"不再掷骰、不再刷骰、并给出可读的理由"。
+
+    事件类型用既有的 ``custom.check.resolved``（在 reducer 里是记录型事件），
+    所以不打破任何现有路径，叙事层靠 ``resolution`` 与 ``reason`` 工作。
+    """
+
+    resolution, reasons = verdict
+    return {
+        "ok": True,
+        "event_batch": {
+            "batch_id": uuid4().hex,
+            "intent_type": intent_type,
+            "actor_id": actor,
+            "events": [{
+                "type": "custom.check.resolved",
+                "actor_id": uid,
+                "check_id": str(getattr(check, "id", "")),
+                "resolution": str(resolution),
+                "reason": list(reasons),
+            }],
+        },
+        "replayed": False,
+        "pending_decision": None,
+    }
+
+
 def _seed_world(raw_world: dict[str, Any], seed: dict[str, dict[str, Any]]) -> None:
     """首次用到世界状态时插入初始对象；已存在的**不覆盖**。
 
@@ -841,6 +875,10 @@ class CustomDeclarativeRuntime:
             check = _find_check(mechanics, str(intent.get("check_id") or ""))
             if check is None:  # validate_intent 已挡；保持 fail-closed。
                 return {"ok": False, "code": "UNKNOWN_CHECK", "error": "未声明的检定"}
+            short = self._pre_roll_verdict(instance, mechanics, check, uid)
+            if short is not None:
+                # 不掷骰：只把裁定本身记下来，不产效果。
+                return _short_circuit_batch(actor, intent_type, uid, check, short)
             resources = self._seat_resources(instance, uid)
             target = custom_state.resolve_target(
                 mechanics, self._sheet(instance, uid), ref=check.target, resources=resources,
@@ -1100,6 +1138,44 @@ class CustomDeclarativeRuntime:
     # ------------------------------------------------------------------
     # 投影
     # ------------------------------------------------------------------
+
+    def _pre_roll_verdict(
+        self, instance: Any, mechanics: CustomMechanics, check: Any, uid: str,
+    ) -> tuple[Resolution, list[str]] | None:
+        """掷骰**之前**的裁定。返回 ``None`` 表示应该掷骰。
+
+        入参来源分两处：
+
+        - ``can_succeed`` / ``can_fail`` / ``failure_matters`` 来自检定的
+          ``adjudication`` 声明 —— 掷骰前还不知道成功度，只能由规则作者表态；
+        - "这个办法已经用尽"来自**尝试账本**，但仅在 ``consult_attempts``
+          为真时才参与（默认关，因为"试过了还要不要掷"是桌风问题）。
+        """
+
+        if not check.can_succeed:
+            return (Resolution.IMPOSSIBLE, ["规则声明：这个办法不可能成功"])
+        if not check.can_fail:
+            return (
+                Resolution.AUTO_SUCCESS,
+                ["规则声明：这个办法不会失败，不需要掷骰"],
+            )
+        if not check.failure_matters:
+            return (Resolution.AUTO_SUCCESS, [
+                "规则声明：失败不留痕迹、可以无限重试 —— 这个骰子没有意义",
+            ])
+        if not check.consult_attempts:
+            return None
+        for family, approach, target in mechanics.action_keys(check.id):
+            status = self.retry_status(
+                instance, actor_id=uid, intent_family=family,
+                target_id=target, approach_signature=approach,
+            )
+            if status.get("allowed") is False:
+                return (
+                    Resolution.AUTO_FAILURE,
+                    [f"尝试账本：{status.get('reason')}"],
+                )
+        return None
 
     def retry_status(
         self, instance: Any, *, actor_id: str, intent_family: str,
