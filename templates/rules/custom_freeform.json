@@ -92,9 +92,13 @@
     ],
     "world_effects": [
       {"check": "will_check", "degree": "extreme", "target": "sealed_door",
-       "field": "state.locked", "op": "override", "value": false},
+       "field": "state.locked", "op": "override", "value": false,
+       "intent_family": "open", "approach_signature": "force",
+       "retry_policy": "REQUIRES_CHANGED_CIRCUMSTANCE"},
       {"check": "will_check", "degree": "failure", "target": "sealed_door",
-       "field": "state.hp", "op": "subtract", "delta": "1d6"}
+       "field": "state.hp", "op": "subtract", "delta": "1d6",
+       "intent_family": "open", "approach_signature": "force",
+       "retry_policy": "REQUIRES_CHANGED_CIRCUMSTANCE"}
     ],
     "authoritative_fields": ["resources", "attributes", "skills"]
   }

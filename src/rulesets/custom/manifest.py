@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.rulesets.adjudication import EFFECT_CHANGE_OPS
+from src.rulesets.attempts import RetryPolicy
 
 MAX_RESOURCES = 24
 MAX_CHECKS = 48
@@ -207,6 +208,11 @@ class WorldEffectSpec:
     op: str
     value: Any = None
     delta: str = ""
+    #: 尝试记录（可选）。声明了 ``intent_family`` 才会把"试过了"记下来 ——
+    #: 不声明就是纯粹的世界变更，与重试无关。
+    intent_family: str = ""
+    approach_signature: str = ""
+    retry_policy: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,9 +516,33 @@ def _parse_world_effects(
                 raise ValueError(
                     f"{where}.delta 必须是整数或骰式（可带符号）: {delta!r}"
                 )
+        family = str(item.get("intent_family") or "").strip().lower()
+        if family:
+            family = _require_id(family, field=f"{where}.intent_family")
+        approach = ""
+        raw_approach = str(item.get("approach_signature") or "").strip().lower()
+        if raw_approach:
+            approach = _require_id(raw_approach, field=f"{where}.approach_signature")
+        policy = str(item.get("retry_policy") or "").strip().upper()
+        if policy:
+            try:
+                policy = str(RetryPolicy(policy))
+            except ValueError as exc:
+                raise ValueError(
+                    f"{where}.retry_policy 必须是 "
+                    f"{[str(p) for p in RetryPolicy]} 之一: {policy!r}"
+                ) from exc
+        if bool(family) != bool(policy):
+            # 不设默许值：默许成 FREE 意味着"失败不留痕"，会让检定彻底失去意义；
+            # 默许成别的又会在背后改变语义。所以要求规则作者明确表态。
+            raise ValueError(
+                f"{where}：intent_family 与 retry_policy 必须同时给出"
+                f"（FREE 会令失败不留痕、检定失去意义，所以不设默许值）"
+            )
         specs.append(WorldEffectSpec(
             check=check_id, degree=degree_id, target=target, field=field_path,
             op=op, value=item.get("value") if has_value else None, delta=delta,
+            intent_family=family, approach_signature=approach, retry_policy=policy,
         ))
     return tuple(specs)
 

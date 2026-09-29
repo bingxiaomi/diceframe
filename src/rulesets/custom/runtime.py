@@ -40,6 +40,11 @@ from typing import Any
 from uuid import uuid4
 
 from src.rulesets.adjudication import effect_descriptors_from, intent_field_violations
+from src.rulesets.attempts import RetryPolicy
+from src.rulesets.attempts import failure_sticks as evaluate_failure_sticks
+from src.rulesets.attempts import record_attempt as record_attempt_entry
+from src.rulesets.attempts import retry_verdict as evaluate_retry
+from src.rulesets.attempts import world_versions as snapshot_world_versions
 from src.rulesets.contracts import RulesetCapabilities
 from src.rulesets.world import apply_effects as apply_world_effects
 from src.rulesets.custom import binding as custom_binding
@@ -111,6 +116,10 @@ INTENT_ADJUST = "custom.resource.adjust"
 #: 对齐 D&D 2024 的 reducer：``intent.submitted`` / ``check.resolved`` 等在那里
 #: 也是列在 match 里的空操作（``dnd2024/combat/reducer.py``）。
 RECORD_ONLY_EVENTS = frozenset({"custom.check.resolved"})
+
+#: 尝试记录事件。还原器会把它**推到批次末尾**才执行：记录里的世界版本必须是
+#: 本批世界变更落盘**之后**的版本，否则"失败本身改了目标"的尝试会把自己作废。
+EVENT_ATTEMPT_RECORD = "custom.attempt.record"
 
 
 @lru_cache(maxsize=64)
@@ -855,11 +864,31 @@ class CustomDeclarativeRuntime:
                     "delta": delta,
                     "reason": f"{check.name}:{outcome.degree_label}",
                 })
-            world_effects = [
-                _world_effect_payload(spec, rng)
-                for spec in mechanics.world_effects
-                if spec.check == check.id and spec.degree == outcome.degree_id
-            ]
+            world_effects: list[dict[str, Any]] = []
+            attempt_events: list[dict[str, Any]] = []
+            seen_attempts: set[tuple[str, ...]] = set()
+            for spec in mechanics.world_effects:
+                if spec.check != check.id or spec.degree != outcome.degree_id:
+                    continue
+                world_effects.append(_world_effect_payload(spec, rng))
+                if not spec.intent_family:
+                    continue
+                signature = (
+                    spec.intent_family, spec.approach_signature,
+                    spec.retry_policy, spec.target,
+                )
+                if signature in seen_attempts:
+                    continue
+                seen_attempts.add(signature)
+                attempt_events.append({
+                    "type": EVENT_ATTEMPT_RECORD,
+                    "actor_id": uid,
+                    "intent_family": spec.intent_family,
+                    "approach_signature": spec.approach_signature,
+                    "retry_policy": spec.retry_policy,
+                    "outcome": outcome.degree_id,
+                    "target": spec.target,
+                })
             if world_effects:
                 # 一次检定只产一条 world.changed，里面包住所有世界变更 ——
                 # 叙事层与审计看到的是"这次裁定改了什么"，不是一堆碎片。
@@ -869,6 +898,8 @@ class CustomDeclarativeRuntime:
                     "reason": f"{check.name}:{outcome.degree_label}",
                     "effects": world_effects,
                 })
+            # 尝试记录放在最后：世界变更先落，版本才有意义。
+            events.extend(attempt_events)
         else:
             resource = _find_resource(mechanics, str(intent.get("resource_id") or ""))
             if resource is None:
@@ -921,6 +952,7 @@ class CustomDeclarativeRuntime:
         mechanics = _mechanics_for(instance)
         applied_events: list[dict[str, Any]] = []
         recorded_events: list[dict[str, Any]] = []
+        deferred_attempts: list[dict[str, Any]] = []
         for event in events:
             if not isinstance(event, dict):
                 raise ValueError(
@@ -929,6 +961,11 @@ class CustomDeclarativeRuntime:
             event_type = str(event.get("type") or "")
             if event_type in RECORD_ONLY_EVENTS:
                 recorded_events.append(deepcopy(event))
+                continue
+            if event_type == EVENT_ATTEMPT_RECORD:
+                # 刻意不在循环里立即写：记录里的世界版本必须是**本批变更落盘
+                # 之后**的版本，所以推到循环外、世界变更都落完之后再处理。
+                deferred_attempts.append(dict(event))
                 continue
             if event_type != "custom.resource.changed" and event_type != "world.changed":
                 raise ValueError(
@@ -991,6 +1028,35 @@ class CustomDeclarativeRuntime:
                 "reason": str(event.get("reason") or ""),
             })
 
+        for event in deferred_attempts:
+            ledger = state.setdefault("attempts", [])
+            if not isinstance(ledger, list):
+                raise ValueError("ruleset_state.attempts 必须是数组")
+            raw_world = state.get("world")
+            raw_world = raw_world if isinstance(raw_world, dict) else {}
+            target = str(event.get("target") or "")
+            entry = record_attempt_entry(
+                ledger,
+                actor_id=str(event.get("actor_id") or ""),
+                outcome=str(event.get("outcome") or ""),
+                intent_family=str(event.get("intent_family") or ""),
+                target_id=target,
+                approach_signature=str(event.get("approach_signature") or ""),
+                retry_policy=str(event.get("retry_policy") or RetryPolicy.FREE),
+                world_versions=(
+                    snapshot_world_versions(raw_world, [target]) if target else {}
+                ),
+            )
+            applied_events.append({
+                "type": EVENT_ATTEMPT_RECORD,
+                "actor_id": entry["actor_id"],
+                "target": target,
+                "intent_family": entry["intent_family"],
+                "approach_signature": entry["approach_signature"],
+                "retry_policy": entry["retry_policy"],
+                "outcome": entry["outcome"],
+            })
+
         if not applied_events and not recorded_events:
             return {
                 "applied": False,
@@ -1034,6 +1100,39 @@ class CustomDeclarativeRuntime:
     # ------------------------------------------------------------------
     # 投影
     # ------------------------------------------------------------------
+
+    def retry_status(
+        self, instance: Any, *, actor_id: str, intent_family: str,
+        target_id: str = "", approach_signature: str = "",
+    ) -> dict[str, Any]:
+        """读尝试账本，回答"这个手段还能不能再来一次"。
+
+        这是三问法里 ``failure_matters`` 那一问的**可用切片**。另外两问
+        （``can_succeed`` / ``can_fail``）目前还没有声明式来源，仍由世界状态
+        与规则文本决定 —— 本条不假装它们已经就绪。
+
+        返回形状：``RetryVerdict`` 的字段 + ``failure_matters``。
+        """
+
+        state = getattr(instance, "ruleset_state", None)
+        state = state if isinstance(state, dict) else {}
+        ledger = state.get("attempts")
+        raw_world = state.get("world")
+        raw_world = raw_world if isinstance(raw_world, dict) else {}
+        target = str(target_id or "")
+        verdict = evaluate_retry(
+            ledger if isinstance(ledger, list) else [],
+            actor_id=str(actor_id or ""),
+            intent_family=str(intent_family or ""),
+            target_id=target,
+            approach_signature=str(approach_signature or ""),
+            world_versions=(
+                snapshot_world_versions(raw_world, [target]) if target else {}
+            ),
+        )
+        payload = verdict.to_dict()
+        payload["failure_matters"] = evaluate_failure_sticks(verdict)
+        return payload
 
     def gameplay_view(
         self, instance: Any, viewer_id: str = "", viewer_is_gm: bool = False,

@@ -273,3 +273,134 @@ def test_unknown_operator_is_rejected() -> None:
             "check": "c1", "degree": "good", "target": "box",
             "field": "state.open", "op": "toggle", "value": True,
         }]))
+
+
+def test_attempt_metadata_requires_both_family_and_policy() -> None:
+    """不设默许值：默许成 FREE 等于"失败不留痕"，会让检定彻底失去意义。"""
+
+    with pytest.raises(ValueError, match="必须同时给出"):
+        parse_custom_mechanics(_mechanics(world_effects=[{
+            "check": "c1", "degree": "good", "target": "box",
+            "field": "state.open", "op": "override", "value": True,
+            "intent_family": "open",
+        }]))
+    with pytest.raises(ValueError, match="必须同时给出"):
+        parse_custom_mechanics(_mechanics(world_effects=[{
+            "check": "c1", "degree": "good", "target": "box",
+            "field": "state.open", "op": "override", "value": True,
+            "retry_policy": "FREE",
+        }]))
+
+
+def test_attempt_metadata_rejects_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="retry_policy 必须是"):
+        parse_custom_mechanics(_mechanics(world_effects=[{
+            "check": "c1", "degree": "good", "target": "box",
+            "field": "state.open", "op": "override", "value": True,
+            "intent_family": "open", "retry_policy": "MAYBE",
+        }]))
+
+
+def test_world_effect_without_attempt_metadata_creates_no_attempt() -> None:
+    """只声明世界变更、不声明尝试元数据 → 与重试无关。"""
+
+    mechanics = parse_custom_mechanics(_mechanics(world_effects=[{
+        "check": "c1", "degree": "good", "target": "box",
+        "field": "state.open", "op": "override", "value": True,
+    }]))
+    assert mechanics.world_effects[0].intent_family == ""
+    assert mechanics.world_effects[0].retry_policy == ""
+
+
+# ---------------------------------------------------------------------------
+# 3. 接线：提交时记账，且记的是**落盘之后**的版本
+# ---------------------------------------------------------------------------
+def test_failure_records_attempt_with_post_commit_version(runtime, rule, tmp_path) -> None:
+    """账本里的世界版本必须等于落盘后的版本 —— 这是防无限重试的关键。"""
+
+    instance = _ready(runtime, rule, tmp_path, "rec")
+    _submit(runtime, instance, _FixedRng(100))  # failure → hp 扣血、版本自增
+
+    attempts = instance.ruleset_state["attempts"]
+    assert attempts, "失败必须留下尝试记录"
+    entry = attempts[-1]
+    assert entry["outcome"] == "FAILURE"
+    assert entry["intent_family"] == "open"
+    assert entry["approach_signature"] == "force"
+    assert entry["retry_policy"] == "REQUIRES_CHANGED_CIRCUMSTANCE"
+    assert entry["world_versions"] == {
+        DOOR: instance.ruleset_state["world"][DOOR]["version"]
+    }, "记的必须是落盘后的版本"
+
+
+def test_same_approach_is_blocked_after_failure(runtime, rule, tmp_path) -> None:
+    """试过了、锁也卡住了 → 同样办法再来一次会被拦住，失败有意义。"""
+
+    instance = _ready(runtime, rule, tmp_path, "block")
+    _submit(runtime, instance, _FixedRng(100))
+
+    status = runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="force",
+    )
+    assert status["allowed"] is False
+    assert status["failure_matters"] is True
+    assert status["policy"] == "REQUIRES_CHANGED_CIRCUMSTANCE"
+
+
+def test_different_approach_is_not_blocked(runtime, rule, tmp_path) -> None:
+    """撬锁失败不该挡住"拿斧头砍门" —— 换手段就是另一个 key。"""
+
+    instance = _ready(runtime, rule, tmp_path, "other")
+    _submit(runtime, instance, _FixedRng(100))
+
+    status = runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="finesse",
+    )
+    assert status["allowed"] is True
+    assert status["attempt"] is None, "另一个 key 查不到记录"
+
+
+def test_gm_changing_the_world_allows_retry(runtime, rule, tmp_path) -> None:
+    """GM 重新锁门 → 版本变 → 旧记录自动失效，不需要任何手工清理。"""
+
+    instance = _ready(runtime, rule, tmp_path, "relock")
+    _submit(runtime, instance, _FixedRng(100))
+    assert runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="force",
+    )["allowed"] is False
+
+    # GM 重新锁门（等价于任何让世界变了的操作）
+    instance.ruleset_state["world"][DOOR]["version"] += 1
+
+    assert runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="force",
+    )["allowed"] is True
+
+
+def test_success_is_recorded_but_does_not_block(runtime, rule, tmp_path) -> None:
+    """成功后不存在"还试不试得动"的问题。"""
+
+    instance = _ready(runtime, rule, tmp_path, "ok")
+    _submit(runtime, instance, _FixedRng(1))  # extreme → 解锁
+
+    assert instance.ruleset_state["attempts"][-1]["outcome"] == "EXTREME" \
+        or instance.ruleset_state["attempts"][-1]["outcome"] == "CRITICAL_SUCCESS"
+    assert runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="force",
+    )["allowed"] is True
+
+
+def test_retry_status_on_empty_history_is_conservative(runtime, rule, tmp_path) -> None:
+    instance = _ready(runtime, rule, tmp_path, "fresh")
+    status = runtime.retry_status(
+        instance, actor_id=UID, intent_family="open", target_id=DOOR,
+        approach_signature="force",
+    )
+    assert status["allowed"] is True
+    assert status["attempt"] is None
+    assert status["failure_matters"] is True, "没有证据时不能替规则文本下结论"
