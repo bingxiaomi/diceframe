@@ -84,7 +84,9 @@ async function load(silent = false): Promise<void> {
     const response = await fetchRulesetAvailableActions(gameKey) as unknown as CustomGameplayResponse
     if (props.gameKey !== gameKey) return
     data.value = response
-    error.value = ''
+    // 静默纠偏**不清错误**：那条消息就是用户刚触发失败的原因，
+    // 擦掉它会让"点了没反应"变成最难查的那种反馈。
+    if (!silent) error.value = ''
     if (!adjustResource.value && resources.value.length) {
       adjustResource.value = String(resources.value[0].resource_id || '')
     }
@@ -118,6 +120,7 @@ async function submit(intent: JsonObject): Promise<void> {
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
     // 失败后用服务端状态纠偏：本地很可能已经不是权威视图了。
+    // （load(true) 刻意不清 error，见那里的注释。）
     await load(true)
   } finally {
     busy.value = false
