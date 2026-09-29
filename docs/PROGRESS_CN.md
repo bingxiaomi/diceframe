@@ -13,26 +13,34 @@
 | 你的仓库 | `https://github.com/bingxiaomi/diceframe` |
 | `mine` 远端 | 上面这个，推送目标 |
 | `upstream` 远端 | `https://github.laiyagushi.com/diceframe/diceframe.git`（国内可直连的上游镜像，供参考） |
-| 当前内容 | **单提交快照**（2094 文件 / 2360 对象 / 约 10 MB，提交号见 `git log`），不含上游 435 个 PR 的历史 |
-| 为什么用快照 | 原始工作副本是 `--depth 1` 浅克隆，直接从它推送会报 `remote unpack failed: index-pack failed` / `did not receive expected object`（差量基准缺失），而且要推 15682 个对象。快照只推 2360 个对象，最稳、其他机器 clone 也最快 |
+| 当前内容 | **完整上游历史**（1228 提交 / 2096 文件 / `.git` 约 92.8 MB），可正常合并上游更新 |
+| 历史背景 | 早期是单提交快照（2094 文件 / 2360 对象 / 约 10 MB）。因为原始工作副本是 `--depth 1` 浅克隆，直接从它推送会报 `remote unpack failed: index-pack failed` / `did not receive expected object`（差量基准缺失），而且要推 15682 个对象；快照只推 2360 个对象，最稳、其他机器 clone 也最快。现已用 `--unshallow` 转为正常 fork |
 | 国内网络 | 直连 github.com 会超时/被重置；已配置 `http.https://github.com.proxy = http://127.0.0.1:7897`（仅对 github.com 生效） |
 
-**后续改完代码怎么发布**（当前是手动流程，尚未脚本化）：
+**后续改完代码怎么发布**（手动流程，尚未脚本化）：
 
 ```bash
-# 1) 在开发副本里提交（如 c:\Users\user\trpg\diceframe）
-git -C <开发副本> add -A && git -C <开发副本> commit -m "feat: ..."
+# 常规方式：在开发副本里提交后直接推（现在是带完整历史的正常 fork）
+git -C c:\Users\user\trpg\diceframe add -A
+git -C c:\Users\user\trpg\diceframe commit -m "feat: ..."
+git -C c:\Users\user\trpg\diceframe push mine main
+```
 
-# 2) 导出已跟踪文件的快照（git archive 天然排除 data/、构建产物、node_modules）
+如果**不想要历史**（体积小、不依赖代理带宽），可以临时重建一个快照副本：
+
+```bash
+# 导出已跟踪文件的快照（git archive 天然排除 data/、构建产物、node_modules）
 git -C <开发副本> archive HEAD -o snapshot.tar
 mkdir -p <发布副本> && tar -xf snapshot.tar -C <发布副本>
 
-# 3) 在发布副本里重建单提交并推送到 mine
 git -C <发布副本> init -b main
 git -C <发布副本> add -A && git -C <发布副本> commit -m "chore: snapshot"
 git -C <发布副本> remote add mine https://github.com/bingxiaomi/diceframe.git
 git -C <发布副本> push --force -u mine main
 ```
+
+> 注意：快照推送会 **force push 覆盖 `mine/main`**，把完整历史换成单个提交，
+> 只有在明确要退回快照分发时才这么做。
 
 > **已完成：仓库已转为带完整上游历史的正常 fork。**
 >
@@ -41,7 +49,7 @@ git -C <发布副本> push --force -u mine main
 > 写 `upstream` 会直接报 `fatal: 'upstream' does not appear to be a git repository`
 > （发布副本里那个 `upstream` 是另外加的，两边不共享）。
 >
-> 结果：提交数由 2 变成 **1227**（最早 `453de26b` Initial public release），
+> 结果：提交数由 2 变成 **1228**（最早 `453de26b` Initial public release），
 > 而 `.git` 只从 91.5 MB 涨到 92.8 MB——镜像在浅克隆时其实已经把大部分历史对象发过来了，
 > `--unshallow` 只需要补上边界缺失的那部分对象。
 >
@@ -49,8 +57,12 @@ git -C <发布副本> push --force -u mine main
 > （写对象 16904 个 / 约 80 MiB，经代理约 5 MiB/s）。由此可正常
 > `git pull origin main` 合并上游更新，`git merge-base` 之类的历史查询也不再失效。
 >
-> 上面那条“单提交快照”路径仍然保留，用于**不需要历史**的分发场景（体积小、推得快、
-> 不依赖代理带宽）。
+> `diceframe-publish` 那个发布副本已经**删除**：它只剩一个孤儿快照提交，被 force push
+> 覆盖后与 `mine/main` 分叉成 `ahead 1, behind 1228`，而且没有任何独有内容
+> （已比对跟踪文件集，是开发副本的子集）。需要快照分发时按上面的命令临时重建。
+>
+> 删仓库副本时有个 Windows 坑：`.git` 里的 pack 文件是**只读**的，直接递归删除会中途
+> 失败并留下空目录（上次就踩了）。先递归清掉只读属性再删就一次成功。
 
 ---
 
