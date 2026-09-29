@@ -343,3 +343,88 @@ def test_reducer_rejects_an_unwritable_change(runtime, rule, tmp_path) -> None:
     }
     with pytest.raises(ValueError):
         runtime.apply_event_batch(instance, batch)
+
+
+# ---------------------------------------------------------------------------
+# 7. 投影给前端 / LLM
+# ---------------------------------------------------------------------------
+def _own_seat(view: dict) -> dict:
+    return next(seat for seat in view["seats"] if seat["is_self"])
+
+
+def test_gameplay_view_serves_the_effective_value_with_its_base(
+    runtime, rule, tmp_path,
+) -> None:
+    """界面拿到的是有效值，同时知道底子在哪 —— 才能显示"44 → 39"。"""
+
+    instance = _ready(runtime, rule, tmp_path, "view")
+    _submit(runtime, instance, FAIL_ROLL)
+
+    seat = _own_seat(runtime.gameplay_view(instance, viewer_id=UID))
+    resolve = seat["resources"]["resolve"]
+
+    assert resolve["value"] == resolve["base"] - 5
+    assert [effect["id"] for effect in seat["effects"]] == ["will_shaken"]
+    assert seat["effects"][0]["source"] == "意志检定:失败"
+    assert seat["effects"][0]["duration"] == {"type": "round", "remaining": 2}
+
+
+def test_view_shape_is_untouched_when_nothing_is_active(
+    runtime, rule, tmp_path,
+) -> None:
+    """没有效果时不长出新字段 —— 绝大多数席位是这种情况，别让载荷平白变胖。"""
+
+    instance = _ready(runtime, rule, tmp_path, "plain")
+
+    seat = _own_seat(runtime.gameplay_view(instance, viewer_id=UID))
+    assert "effects" not in seat
+    resolve = seat["resources"]["resolve"]
+    assert "base" not in resolve
+    assert resolve["value"] == instance.ruleset_state["players"][UID]["resources"]["resolve"]
+
+
+def test_other_seats_do_not_leak_effects(runtime, rule, tmp_path) -> None:
+    """效果和资源一样属于隐私边界：非 GM 看别人的席位只得到摘要。"""
+
+    instance = _ready(runtime, rule, tmp_path, "privacy")
+    _submit(runtime, instance, FAIL_ROLL)
+    rival = "rival_player"
+    instance.players[rival] = {"character_name": "对手"}
+    instance.ruleset_state.setdefault("players", {})[rival] = {
+        "resources": {"resolve": 50},
+    }
+
+    view = runtime.gameplay_view(instance, viewer_id=UID)
+    other = next(seat for seat in view["seats"] if seat["player_id"] == rival)
+
+    assert "effects" not in other
+    assert "resources" not in other
+    assert other["resource_count"] == 1
+
+    gm_view = runtime.gameplay_view(instance, viewer_id=UID, viewer_is_gm=True)
+    gm_other = next(seat for seat in gm_view["seats"] if seat["player_id"] == rival)
+    assert gm_other["resources"]["resolve"]["value"] == 50
+
+
+def test_llm_view_carries_effective_values_and_a_warning(
+    runtime, rule, tmp_path,
+) -> None:
+    """GM 模型必须看到有效值，并且明确被告知不要去写这些数字。"""
+
+    instance = _ready(runtime, rule, tmp_path, "llm")
+    _submit(runtime, instance, FAIL_ROLL)
+
+    authority = runtime.build_llm_view(instance)["ruleset_authority"]
+    seat = authority["seats"][UID]
+
+    assert seat["resources"]["resolve"]["value"] == seat["resources"]["resolve"]["base"] - 5
+    assert [effect["id"] for effect in seat["effects"]] == ["will_shaken"]
+    assert "Never write these numbers" in authority["effective_values"]
+
+
+def test_llm_view_omits_effects_when_there_are_none(runtime, rule, tmp_path) -> None:
+    instance = _ready(runtime, rule, tmp_path, "llm_plain")
+
+    authority = runtime.build_llm_view(instance)["ruleset_authority"]
+    assert "effects" not in authority["seats"][UID]
+    assert "base" not in authority["seats"][UID]["resources"]["resolve"]
