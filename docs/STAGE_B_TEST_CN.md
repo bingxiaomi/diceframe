@@ -14,31 +14,33 @@
 
 Stage A 的价值是**零风险**：不接管任何流水线，只做投影和护栏。
 
-## 2. 打开 Stage B
+## 2. 开关（**默认已开**）
 
-能力位在模块导入时求值一次，所以**必须在启动服务之前**设置环境变量：
+两个开关**默认就是开的**，所以正常启动（`web_ui.bat` / `scripts/start_webui.py`）
+不需要设任何环境变量。
+
+能力位在模块导入时求值一次，所以**要改就必须在启动服务之前**设置：
 
 ```powershell
-# PowerShell —— 权威意图路径
-$env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "1"
-
-# 专业建卡（阶段 0）—— 存档被自动绑定、规则声明被自动快照
-$env:DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER = "1"
+# PowerShell —— 退回 Stage A（只做投影与护栏，不接管回合）
+$env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "0"
+$env:DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER = "0"
 ```
 
 ```bash
 # bash
-export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=1
-export DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1
+export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=0
+export DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=0
 ```
 
-默认（不设置）就是 Stage A + 引导式建卡。不需要改源码。
+**两个开关必须成对**：绑定只在 `character_builder == "professional"` 的分支里写入，
+所以只关掉 `PROFESSIONAL_BUILDER` 而留着 `AUTHORITATIVE_INTENTS` 会得到
+`RULESET_BINDING_MISMATCH`（有权威意图，但存档没被绑定）。
 
-> **`DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER` 为什么默认关**：打开后
-> `describe_experience` 会返回 `profile="custom"`，而前端注册表
-> （`frontend-v2/src/features/rulesets/registry.ts`）里还没有对应的建卡组件，
-> 入局 / 建房页会报 `Unsupported ruleset experience`。后端逻辑可以先用测试
-> 验证（见下），前端组件补完再打开默认值。
+> **为什么曾经默认关，现在翻转了**：打开后 `describe_experience` 返回
+> `profile="custom"`，而前端注册表当时没有对应组件，入局 / 建房页会报
+> `Unsupported ruleset experience`；也没有能提交自定义意图的面板。
+> 两者现已落地（`frontend-v2/src/features/rulesets/custom/`），所以默认值翻转。
 
 ## 3. 三道门槛（缺一不可）
 
@@ -54,9 +56,9 @@ export DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1
 （`src/webui/services/characters.py` 与 `src/webui/services/ruleset_characters.py`），
 都在 `character_builder == "professional"` / `character_lifecycle == "rules_aware"` 的建卡流程里。
 
-> **已解决（阶段 0，默认关闭）**：设 `DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1`
-> 就会走专业建卡分支，绑定与规则快照**自动**发生，不再需要手工改存档。
-> 未设开关时仍是 `guided` / `legacy`，普通对局不会被绑定。
+> **已解决（阶段 0，现为默认）**：专业建卡分支会走，绑定与规则快照**自动**发生，
+> 不再需要手工改存档。设 `DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=0` 会退回
+> `guided` / `legacy`，那时普通对局不会被绑定。
 
 **门槛③为什么会存在**：`RulesetRuntime` 协议只在**建卡方法**里把 `rule` 交给运行时；
 游戏期方法（`available_intents` / `validate_intent` / `resolve_intent` /

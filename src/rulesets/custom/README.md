@@ -48,7 +48,7 @@ src/rulesets/custom/
 
 ## 两个阶段
 
-### Stage A：叙事模式（默认，`AUTHORITATIVE_INTENTS = False`）
+### Stage A：叙事模式（`AUTHORITATIVE_INTENTS = 0` 时）
 
 不接管回合流水线。玩家照旧自由文本行动，引擎走原有的叙事检定路径。你负责：
 
@@ -58,9 +58,11 @@ src/rulesets/custom/
 - `on_player_join` —— 新席位加入时派发声明式资源；
 - `validate_character` / `derive_character` —— 建卡数值校验与派生。
 
-**零风险、立刻生效。建议先跑这一档，把规则数值调舒服了再上 Stage B。**
+**零风险。** 以前建议先跑这一档；两档现在都有前端（建卡器 + 检定面板），
+所以**默认跑 Stage B**，要退回只需设 `=0`（两个开关必须成对，见
+`docs/STAGE_B_TEST_CN.md`）。
 
-### Stage B：权威模式（`AUTHORITATIVE_INTENTS = True`）
+### Stage B：权威模式（**默认**）
 
 打开 `src/webui/services/ruleset_gameplay.py` 的权威意图路径：
 
@@ -165,5 +167,9 @@ filter_narrative_state_update → 剔除了 resources/attributes/skills
   `ruleset_character` / `rule_binding`。要让存档绑定你的 runtime（`bind_ruleset_runtime`），
   需要改成 `rules_aware` 并在 `normalize_character_submission` 里返回
   `{"ruleset_character": {...}, "rule_binding": {...}}`（范本：`src/rulesets/dnd2024/character/builder.py`）。
-- 前端 host 组件尚未提供：Stage A 不需要；Stage B 的 `available_intents` 目前没有 UI 消费。
+- 前端组件已提供：`frontend-v2/src/features/rulesets/custom/` 下是建卡器与
+  「规则与检定」面板（在 `registry.ts` 里注册 `profile="custom"` 与 `runtime="custom:declarative"`）。
+  面板目前把所有规则声明都渲染给所有玩家看 —— 包括给规则作者看的推理链；
+  按角色区分是待办（见 `docs/`）。
+- 推理链（`RuleTrace`）与状态版本号目前**不过滤观众**：它们在玩家面板上也能看到。
 - 资源上限用 `max` 声明；`delta` 的下限目前固定为 0（按需在 `apply_event_batch` 里改成声明式）。

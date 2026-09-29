@@ -9,9 +9,9 @@
     投影   gameplay_view（前端）/ build_llm_view（GM 模型）
     生命周期 migrate_state / project_legacy_character
 
-两类运行模式（``AUTHORITATIVE_INTENTS`` 开关）：
+两类运行模式（``AUTHORITATIVE_INTENTS`` 开关，**默认开启**）：
 
-**Stage A（默认，``authoritative_intents=False``）**
+**Stage A（``authoritative_intents=False``，设 ``=0`` 退回）**
     完全不接管回合流水线。玩家照常自由文本行动，引擎走
     ``check_mechanic`` + ``engine/checks.py`` 的叙事检定路径。本运行时负责：
 
@@ -19,14 +19,15 @@
     - 阻止 LLM 通过叙事标签改写权威字段（``filter_narrative_state_update``）；
     - 新席位加入时派发初始资源（``on_player_join``）。
 
-**Stage B（``authoritative_intents=True``）**
+**Stage B（``authoritative_intents=True``，默认）**
     打开权威意图路径：``available_intents`` 暴露可点选动作，
     ``resolve_intent`` 用服务端 RNG 掷骰并产出 EventBatch，``apply_event_batch``
     落状态。因为 ``narrative_turns=True``，**日常仍是自由文本**，只有你主动把
     ``ruleset_state["combat"]["status"]`` 置为 ``"active"`` 才会强制结构化意图
     （D&D 2024 用的就是这个模式）。
 
-切到 Stage B 需要同步做前端 host 组件（见 README）。
+它曾经是默认值，因为在补完前端 host 组件之前打开会让入局页直接报错；组件现在
+在 ``frontend-v2/src/features/rulesets/custom/`` 下，所以默认翻转。
 """
 
 from __future__ import annotations
@@ -87,40 +88,56 @@ from src.rulesets.custom.manifest import (
 logger = logging.getLogger("trpg")
 
 # ---------------------------------------------------------------------------
-# 模式开关：Stage B（权威意图路径）。默认关闭 = Stage A。
+# 模式开关：权威意图路径 + 专业建卡。**默认开启**。
 #
-# 不用改源码：设置环境变量即可，但**必须在服务启动之前**设置，
-# 因为能力位在模块导入时求值一次。
+# 这两项曾经默认关闭，因为打开后还需要两样东西才不成灾：
+#   - 前端要能渲染 ``profile="custom"`` 的建卡器（否则入局页报
+#     ``Unsupported ruleset experience``）；
+#   - 前端要有能提交自定义意图的面板（否则点了没用）。
+# 两者都已落地（``frontend-v2/src/features/rulesets/custom/``），所以默认翻转。
 #
-#     PowerShell:  $env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "1"
-#     bash:        export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=1
+# **退回 Stage A**：设 ``=0`` 即可，但必须在服务启动之前设 ——
+# 能力位在模块导入时求值一次。
 #
-# 打开后还需要另外两个条件，否则 HTTP 接口会明确报错：
-#   - 存档必须已绑定本运行时，否则 ``RULESET_BINDING_MISMATCH``；
-#   - 前端 host 组件要能渲染自定义意图，否则点了没用。
+#     PowerShell:  $env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "0"
+#     bash:        export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=0
+#
+# 打开后还需要存档已绑定本运行时，否则 HTTP 接口报 ``RULESET_BINDING_MISMATCH``。
 # 自测：``scripts/dev/test_stage_b.py``（离线，不需要服务/LLM/token）。
 # 说明：``docs/STAGE_B_TEST_CN.md``。
 # ---------------------------------------------------------------------------
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in _TRUTHY
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    """读布尔开关。
+
+    **未设置或只写了空白**时用 ``default``；显式写了别的值就按真假集合解析 ——
+    这样 ``=0`` / ``=false`` 永远是关，而不会因为"非空所以算开"变成反直觉的行为。
+    """
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in _TRUTHY
 
 
-AUTHORITATIVE_INTENTS = _env_flag("DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS")
+AUTHORITATIVE_INTENTS = _env_flag(
+    "DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS", default=True,
+)
 
 # 专业建卡（阶段 0）：打开后 ``character_builder`` 变 professional、
 # ``character_lifecycle`` 变 rules_aware，存档才会被绑定、规则声明才会快照。
 #
-# 打开前必须知道两件事：
-#   1. ``describe_experience`` 会返回 ``profile="custom"``，而前端注册表里
-#      目前只有 ``dnd2024`` 的建卡组件 —— 没补组件时入局 / 建房页会报
-#      ``Unsupported ruleset experience``。
-#   2. ``rules_aware`` 会禁用旧版通用角色编辑接口（这是有意的：权威数值
-#      只能经规则运行时变化）。
-# 因此默认关闭；见 ``docs/STAGE_B_TEST_CN.md``。
-PROFESSIONAL_BUILDER = _env_flag("DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER")
+# **这两件事必须成对**：绑定只在 ``character_builder == "professional"`` 的
+# 分支里写入，所以只开 ``AUTHORITATIVE_INTENTS`` 会得到
+# ``RULESET_BINDING_MISMATCH``（有权威意图，但存档没绑定）。
+#
+# ``rules_aware`` 会禁用旧版通用角色编辑接口 —— 这是有意的：权威数值只能经
+# 规则运行时变化。
+PROFESSIONAL_BUILDER = _env_flag(
+    "DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER", default=True,
+)
 
 INTENT_CHECK = "custom.check.roll"
 INTENT_ADJUST = "custom.resource.adjust"

@@ -1,21 +1,20 @@
-"""``custom:declarative`` 的专业建卡（阶段 0）：绑定与规则快照必须**自动**发生。
+"""``custom:declarative`` 的专业建卡：绑定与规则快照必须**自动**发生。
 
-阶段 0 的目标不是"多一个建卡器"，而是让上一轮发现的两道手工门槛变成自动的：
+建卡本身不是目标，让两道手工门槛变成自动的才是：
 
     门槛②  存档被绑定（``bind_ruleset_runtime``）
     门槛③  规则声明进了 ``ruleset_state["mechanics"]``
 
-做法是打开 ``character_builder="professional"`` +
-``character_lifecycle="rules_aware"``。但默认能力位**不能**跟着打开 ——
-``describe_experience`` 会返回 ``profile="custom"``，而前端注册表里还没有对应的
-建卡组件，打开会让入局 / 建房页报 ``Unsupported ruleset experience``。
-
-所以这里用"继承真 runtime、只覆盖 ``capabilities``"的写法（范本：
-``tests/rulesets/test_dnd2024_m5_http.py``），既测到专业分支，又不动发布默认值。
+做法是 ``character_builder="professional"`` + ``character_lifecycle="rules_aware"``。
+这两项**现在是发布默认值** —— 它们曾经关闭，因为 ``describe_experience`` 会返回
+``profile="custom"`` 而前端注册表当时没有对应组件，打开会让入局 / 建房页报
+``Unsupported ruleset experience``。组件现已落地
+（``frontend-v2/src/features/rulesets/custom/``），所以默认翻转。
 """
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -25,6 +24,7 @@ from src.engine.game_instance import GameRegistry
 from src.rules.loader import RuleBundleLoader
 from src.rules.rule_system import RuleSystem
 from src.rulesets.contracts import RulesetCapabilities
+from src.rulesets.custom import runtime as custom_runtime
 from src.rulesets.custom.runtime import CustomDeclarativeRuntime
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -99,14 +99,59 @@ def _join(instance, card: dict, uid: str = UID, runtime=None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 默认能力位必须保持关闭
+# 发布默认值
 # ---------------------------------------------------------------------------
-def test_default_capabilities_stay_off() -> None:
-    """发布默认值不能被测试带偏，否则前端会坏。"""
+_SWITCHES = (
+    "DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS",
+    "DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER",
+)
+
+
+def test_default_capabilities_are_on() -> None:
+    """发布默认值是**开**。
+
+    它守的是**发布默认值**，不是当前进程的设置：默认值一旦被改回去，前端组件
+    与建卡分支的假设会同时失效（入局页报 ``Unsupported ruleset experience``，
+    而存档也不会再被绑定）。
+
+    有人显式设了环境变量时，这里测的就不是默认值了，所以跳过并说明 —— 否则
+    "我临时退回 Stage A 跑一下测试"会得到一条看不懂的失败。
+    """
+
+    overridden = [name for name in _SWITCHES if name in os.environ]
+    if overridden:
+        pytest.skip(f"环境变量已覆盖默认值：{', '.join(overridden)}")
 
     capabilities = CustomDeclarativeRuntime.capabilities
-    assert capabilities.character_builder == "guided"
-    assert capabilities.character_lifecycle == "legacy"
+    assert capabilities.character_builder == "professional"
+    assert capabilities.character_lifecycle == "rules_aware"
+    assert capabilities.authoritative_intents is True
+
+
+def test_env_flag_never_treats_an_explicit_zero_as_on() -> None:
+    """``_env_flag``：**未设置或只有空白**才用默认值；显式写了就按真假集合解析。
+
+    "非空即真"会让 ``=0`` 变成开 —— 那是最反直觉的一类开关 bug，而默认翻转之后
+    它正好是最常用的那一个值。
+    """
+
+    name = "DICEFRAME_TEST_FLAG_PROBE"
+    os.environ.pop(name, None)
+    try:
+        assert custom_runtime._env_flag(name) is False
+        assert custom_runtime._env_flag(name, default=True) is True
+
+        for raw, expected in (
+            ("0", False), ("false", False), ("off", False), ("no", False),
+            ("1", True), ("true", True), ("YES", True), ("ON", True),
+        ):
+            os.environ[name] = raw
+            assert custom_runtime._env_flag(name, default=True) is expected, raw
+
+        os.environ[name] = "   "
+        assert custom_runtime._env_flag(name, default=True) is True, "空白 = 未设置"
+    finally:
+        os.environ.pop(name, None)
 
 
 # ---------------------------------------------------------------------------

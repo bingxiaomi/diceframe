@@ -391,7 +391,8 @@ def spawn_child(mode: str) -> tuple[list[dict], str]:
     if mode == "stage-b":
         env[ENV_FLAG] = "1"
     else:
-        env.pop(ENV_FLAG, None)
+        # 显式置 0，不靠"不设置"。开关默认已翻转为开，靠删除变量拿不到 Stage A。
+        env[ENV_FLAG] = "0"
     argv = [sys.executable, str(Path(__file__).resolve()), "--child", mode]
     if VERBOSE:
         argv.append("--verbose")
