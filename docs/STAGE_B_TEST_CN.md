@@ -19,16 +19,26 @@ Stage A 的价值是**零风险**：不接管任何流水线，只做投影和�
 能力位在模块导入时求值一次，所以**必须在启动服务之前**设置环境变量：
 
 ```powershell
-# PowerShell
+# PowerShell —— 权威意图路径
 $env:DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS = "1"
+
+# 专业建卡（阶段 0）—— 存档被自动绑定、规则声明被自动快照
+$env:DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER = "1"
 ```
 
 ```bash
 # bash
 export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=1
+export DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1
 ```
 
-默认（不设置）就是 Stage A。不需要改源码。
+默认（不设置）就是 Stage A + 引导式建卡。不需要改源码。
+
+> **`DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER` 为什么默认关**：打开后
+> `describe_experience` 会返回 `profile="custom"`，而前端注册表
+> （`frontend-v2/src/features/rulesets/registry.ts`）里还没有对应的建卡组件，
+> 入局 / 建房页会报 `Unsupported ruleset experience`。后端逻辑可以先用测试
+> 验证（见下），前端组件补完再打开默认值。
 
 ## 3. 三道门槛（缺一不可）
 
@@ -43,14 +53,30 @@ export DICEFRAME_CUSTOM_AUTHORITATIVE_INTENTS=1
 **门槛②为什么容易踩**：绑定只由 `instance.bind_ruleset_runtime(...)` 写入，而全仓库只有两处调用
 （`src/webui/services/characters.py` 与 `src/webui/services/ruleset_characters.py`），
 都在 `character_builder == "professional"` / `character_lifecycle == "rules_aware"` 的建卡流程里。
-本运行时用的是 `guided` / `legacy`，所以**普通对局永远不会被绑定** —— 这是 Stage B 目前最大的缺口。
+
+> **已解决（阶段 0，默认关闭）**：设 `DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1`
+> 就会走专业建卡分支，绑定与规则快照**自动**发生，不再需要手工改存档。
+> 未设开关时仍是 `guided` / `legacy`，普通对局不会被绑定。
 
 **门槛③为什么会存在**：`RulesetRuntime` 协议只在**建卡方法**里把 `rule` 交给运行时；
 游戏期方法（`available_intents` / `validate_intent` / `resolve_intent` /
 `apply_event_batch` / `gameplay_view` / `build_llm_view`）只拿得到 `instance`，
-而且没有任何建卡方法同时拿得到 `instance`。所以规则声明必须在建卡时快照进
-`ruleset_state`（`CustomDeclarativeRuntime.seed_rule_snapshot(instance, rule)`），
-游戏期从存档读。这也让存档自包含：规则文件之后被改动不会让进行中的对局悄悄换规则。
+而且没有任何建卡方法同时拿得到 `instance`。
+
+解法是让规则声明**随角色卡走**，再由唯一一个同时拿得到 `instance` 的钩子落盘：
+
+```
+finalize_character(rule, draft)                   有 rule、无 instance
+  └→ {"rule_binding":…, "ruleset_character": {…, "mechanics": 声明}}
+       ↓  characters.py 组装 character_sheet
+     cs["ruleset_character"] = character["ruleset_character"]
+       ↓  characters.py 调 on_player_join()
+     ruleset_state["mechanics"] = sheet["ruleset_character"]["mechanics"]
+```
+
+游戏期读规则时按可信度降序回退（`runtime._mechanics_for`）：
+`ruleset_state` 快照 → 席位角色卡（**只读**自愈，老存档用）→ 宿主传入的规则对象。
+读路径**不写**状态 —— `available_intents` / `gameplay_view` 可能在写锁之外被调用。
 
 ## 4. 离线自测（推荐先跑这个）
 
@@ -108,6 +134,11 @@ C4 的 16/20 失败率来自示例规则里 `will_check` 的 `lte` 阈值较苛�
 1. 在 WebUI 里用 `custom_freeform` 规则开一局（这样才有存档）。
 2. **停掉服务**，给该存档补上绑定和规则快照（因为 `guided`/`legacy` 建卡流程不会写）：
 
+   > 如果已经打开 `DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER=1` 走专业建卡
+   > （阶段 0），这一步就**不需要**了 —— 绑定与快照会在建卡时自动写入。
+   > 但那个开关目前要求前端先有 `profile="custom"` 的建卡组件，所以现阶段
+   > 手工补一次仍然是最快的验证路径。
+
 ```python
 import sys
 sys.path.insert(0, r"<仓库绝对路径>")
@@ -159,21 +190,46 @@ Stage B 要达到"能玩"还差两块，都不在本测试覆盖范围内：
 
 1. **前端 host 组件** —— `available_actions` 返回的意图需要能渲染成可点按钮，
    并把点击结果落到 `ruleset_state` 的新值上。目前前端只认引擎自己的动作卡片。
-2. **`character_lifecycle="rules_aware"`** —— 只有实现它，绑定（门槛②）和规则快照
-   （门槛③）才会在正常建卡流程里自动发生，从而不必手工改存档。
-   参考实现：`src/rulesets/dnd2024/character/builder.py`。
+2. **`custom` 的建卡组件**（阶段 0b）—— 后端专业建卡已经就绪（默认关），
+   但 `profile="custom"` 还没有对应的 Vue 组件，所以还不能把默认值打开。
+   参考实现：`frontend-v2/src/features/rulesets/dnd2024/create/Dnd2024CharacterBuilder.vue`。
 
-在此之前，Stage A 是稳定可用的形态：规则数值、资源和叙事护栏都已经生效，
+`character_lifecycle="rules_aware"` 以及"绑定 + 规则快照自动产生"这条链路**已经实现**
+（阶段 0，默认关闭；打开方式见第 2 节的 `DICEFRAME_CUSTOM_PROFESSIONAL_BUILDER`）。
+
+除此之外，Stage A 是稳定可用的形态：规则数值、资源和叙事护栏都已经生效，
 只是检定仍由引擎的叙事检定路径走。
+
+## 6.5 阶段 0 的验收测试
+
+`tests/rulesets/test_custom_character_lifecycle.py`（17 项）覆盖了建卡方法与那两道门槛。
+关键写法是**继承真 runtime、只覆盖 `capabilities`**，这样默认能力位保持关闭也能测专业分支：
+
+```python
+class _ProfessionalRuntime(CustomDeclarativeRuntime):
+    capabilities = RulesetCapabilities(
+        character_builder="professional", character_lifecycle="rules_aware",
+        authoritative_intents=True, narrative_turns=True,
+    )
+```
+
+三条最值得看的断言：
+
+| 测试 | 保证什么 |
+| --- | --- |
+| `test_quick_presets_are_directly_finalizable` | 预设 draft 能原样喂给 finalize（前端一键建卡靠这条） |
+| `test_normalize_discards_client_derived_values` | 客户端提交的 hp/AC 被丢弃重算 |
+| `test_join_binds_runtime_and_seeds_declaration` | **阶段 0 的验收**：绑定 + 规则快照自动产生 |
 
 ## 7. 相关文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/rulesets/custom/runtime.py` | 运行时实现；`AUTHORITATIVE_INTENTS` 开关、`seed_rule_snapshot` |
+| `src/rulesets/custom/runtime.py` | 运行时实现；两个 env 开关、6 个建卡方法、`seed_rule_snapshot` |
 | `src/rulesets/custom/manifest.py` | 解析 `custom_mechanics`（无枚举白名单，fail-fast） |
 | `src/rulesets/custom/state.py` | 读写 `instance.ruleset_state` / `event_ledger` |
 | `src/rulesets/custom/binding.py` | `rule_binding()` 四字段 + 版本常量 |
 | `src/webui/services/ruleset_gameplay.py` | HTTP 与服务层门控（`_context`） |
 | `scripts/dev/test_stage_b.py` | 本指南第 4 节的离线自测 |
+| `tests/rulesets/test_custom_character_lifecycle.py` | 阶段 0 验收（建卡方法 + 绑定 + 规则快照） |
 | `templates/rules/custom_freeform.json` | 示例规则（`will_check` / `resolve`） |
